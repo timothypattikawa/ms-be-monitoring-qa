@@ -1,0 +1,11 @@
+{
+  "10001" : {"var": "InvalidRequest", "msg": "Invalid request"},
+
+  "AU-10001": {"var": "LoginFailed", "msg": "Error when Login"},
+
+  "UM-10001": {"var": "UserNotFound", "msg": "User not found"},
+
+
+  "RM-10001": {"var": "RateNotFound", "msg": "Could not find rate"},
+  "RM-10002": {"var": "BranchIdRequired", "msg": "Branch ID is required"}
+}
