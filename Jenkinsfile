@@ -1,26 +1,45 @@
 pipeline {
     agent any
 
+    environment {
+        // Ganti nama-image sesuai keinginan
+        IMAGE_NAME = "boiler-plate-api"
+        DOCKER_TAG = "${BUILD_NUMBER}"
+    }
+
     stages {
-        stage('Checkout Code') {
+        stage('Build Docker Image') {
             steps {
-                // Jenkins otomatis melakukan checkout, tapi kita bisa tambahkan echo
-                echo 'Mengambil source code dari GitHub...'
-            }
-        }
-        
-        stage('Build') {
-            steps {
-                echo 'Sedang melakukan proses Build...'
-                // Contoh command simple:
-                sh 'ls -la' 
+                script {
+                    echo 'Membangun Docker Image...'
+                    // Pastikan ada file 'Dockerfile' di repo Anda
+                    sh "docker build -t ${IMAGE_NAME}:${DOCKER_TAG} ."
+                }
             }
         }
 
-        stage('Test') {
+        stage('Test Image') {
             steps {
-                echo 'Sedang menjalankan Unit Test...'
+                echo 'Testing container...'
+                // Contoh simple: Cek versi (sesuaikan dengan bahasa prog, misal node -v)
+                sh "docker run --rm ${IMAGE_NAME}:${DOCKER_TAG} echo 'Container Berjalan!'"
             }
+        }
+        
+        // Uncomment tahap ini jika nanti sudah siap push ke AWS ECR / DockerHub
+        /*
+        stage('Push to Registry') {
+            steps {
+                echo 'Pushing image...'
+            }
+        }
+        */
+    }
+    
+    post {
+        always {
+            // Bersihkan image agar disk server tidak penuh
+            sh "docker rmi ${IMAGE_NAME}:${DOCKER_TAG} || true"
         }
     }
 }
