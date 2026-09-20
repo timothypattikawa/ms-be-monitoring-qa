@@ -1,0 +1,8 @@
+.env*
+*.log
+tmp/
+*.pem
+*.pub
+*.csv
+.idea
+.DS_Store

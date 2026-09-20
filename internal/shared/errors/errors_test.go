@@ -1,8 +1,15 @@
 package errors
 
-import "testing"
+import (
+	"net/http"
+	"testing"
+)
 
 func TestIs(t *testing.T) {
+	errUpdateRepo := New(http.StatusInternalServerError, "01-00", "failed to update repository")
+	errUpdateApproval := New(http.StatusInternalServerError, "02-00", "failed to update approval")
+	errCreateApproval := New(http.StatusInternalServerError, "02-01", "failed to create approval")
+
 	type args struct {
 		err    error
 		target error
@@ -15,32 +22,32 @@ func TestIs(t *testing.T) {
 		{
 			name: "same",
 			args: args{
-				err:    ErrUpdateRepo,
-				target: ErrUpdateRepo,
+				err:    errUpdateRepo,
+				target: errUpdateRepo,
 			},
 			want: true,
 		},
 		{
 			name: "same with underlying",
 			args: args{
-				err:    WithUnderlyingMsg(ErrUpdateRepo, "test"),
-				target: ErrUpdateRepo,
+				err:    WithUnderlyingMsg(errUpdateRepo, "test"),
+				target: errUpdateRepo,
 			},
 			want: true,
 		},
 		{
 			name: "same with wrap",
 			args: args{
-				err:    Wrap(ErrUpdateRepo, "test"),
-				target: ErrUpdateRepo,
+				err:    Wrap(errUpdateRepo, "test"),
+				target: errUpdateRepo,
 			},
 			want: true,
 		},
 		{
 			name: "different code",
 			args: args{
-				err:    ErrUpdateApproval,
-				target: ErrCreateApproval,
+				err:    errUpdateApproval,
+				target: errCreateApproval,
 			},
 			want: false,
 		},

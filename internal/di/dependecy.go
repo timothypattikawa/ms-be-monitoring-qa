@@ -1,10 +1,9 @@
 package di
 
 import (
-	"fmt"
 	"sync"
 
-	"github.com/Beyondtech-ID/ms-backbone-emoney/configs"
+	"github.com/Beyondtech-ID/boiler-plate-be-api/configs"
 	"go.uber.org/dig"
 )
 
@@ -29,13 +28,19 @@ func RegisterDependency(container *dig.Container) error {
 		return err
 	}
 
-	fmt.Println("oke sampe sini")
-
 	if err := container.Provide(NewDatabase); err != nil {
 		return err
 	}
 
 	if err := container.Provide(NewLogger); err != nil {
+		return err
+	}
+
+	if err := container.Provide(NewRedisClient); err != nil {
+		return err
+	}
+
+	if err := container.Provide(NewCacheRedis); err != nil {
 		return err
 	}
 

@@ -3,7 +3,7 @@
 package db
 
 import (
-	"github.com/Beyondtech-ID/ms-backbone-emoney/configs"
+	"github.com/Beyondtech-ID/boiler-plate-be-api/configs"
 	"gorm.io/driver/postgres"
 
 	//nolint:typecheck

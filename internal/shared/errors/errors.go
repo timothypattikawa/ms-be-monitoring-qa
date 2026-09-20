@@ -7,15 +7,16 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/Beyondtech-ID/boiler-plate-be-api/configs"
 	"github.com/joomcode/errorx"
 )
 
 var (
-	ErrNamespace        = errorx.NewNamespace("ms-backbone-emoney")
+	ErrNamespace        = errorx.NewNamespace("boiler-plate-be-api")
 	ErrCodeProperty     = errorx.RegisterProperty("code")
 	ErrHttpCodeProperty = errorx.RegisterProperty("httpcode")
 	ErrCause            = errorx.RegisterProperty("cause")
-	ErrBase             = errorx.NewType(ErrNamespace, "ms-backbone-emoney")
+	ErrBase             = errorx.NewType(ErrNamespace, configs.GetConfig().AppConfig.Name)
 )
 
 func New(httpCode int, code string, msg string, args ...any) *errorx.Error {

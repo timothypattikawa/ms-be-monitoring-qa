@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Beyondtech-ID/ms-backbone-emoney/pkg/helper"
+	"github.com/Beyondtech-ID/boiler-plate-be-api/pkg/helper"
 	"github.com/joho/godotenv"
 	"github.com/spf13/viper"
 )
@@ -17,9 +17,14 @@ import (
 var Of *Config = &Config{}
 
 type Config struct {
-	AppConfig   App   `mapstructure:"app"`
-	DBConfig    DB    `mapstructure:"db"`
-	RedisConfig Redis `mapstructure:"redis"`
+	AppConfig App   `mapstructure:"app"`
+	DBConfig  DB    `mapstructure:"db"`
+	Cache     Cache `mapstructure:"cache"`
+	OTel      OTel  `mapstructure:"otel"`
+}
+
+type OTel struct {
+	CollectorAddr string `mapstructure:"collectoraddr"`
 }
 
 type App struct {
@@ -44,12 +49,21 @@ type DB struct {
 	MaxConnLifeTime   time.Duration `mapstructure:"max_conn_life_time"`
 }
 
-type Redis struct {
-	Host  string `mapstructure:"host"`
-	Port  string `mapstructure:"port"`
-	User  string `mapstructure:"user"`
-	Pass  string `mapstructure:"pass"`
-	Index string `mapstructure:"index"`
+type Cache struct {
+	Address      string        `mapstructure:"address"`
+	UserName     string        `mapstructure:"user_name"`
+	Password     string        `mapstructure:"password"`
+	DB           int           `mapstructure:"db"`
+	UsingTls     bool          `mapstructure:"using_tls"`
+	TlsCaCert    string        `mapstructure:"tls_ca_cert"`
+	TlsCert      string        `mapstructure:"tls_cert"`
+	TlsKey       string        `mapstructure:"tls_key"`
+	PoolSize     int           `mapstructure:"pool_size"`
+	MinIdleConn  int           `mapstructure:"min_idle_conn"`
+	DialTimeout  time.Duration `mapstructure:"dial_timeout"`
+	ReadTimeout  time.Duration `mapstructure:"read_timeout"`
+	WriteTimeout time.Duration `mapstructure:"write_timeout"`
+	MaxConnAge   time.Duration `mapstructure:"max_conn_age"`
 }
 
 var (
@@ -81,6 +95,8 @@ func GetConfig() *Config {
 			if err := v.Unmarshal(cfg); err != nil {
 				panic(fmt.Errorf("failed to unmarshal config: %w", err))
 			}
+
+			Of = cfg
 		},
 	)
 

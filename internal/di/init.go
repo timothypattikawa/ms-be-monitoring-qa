@@ -1,8 +1,8 @@
 package di
 
 import (
-	"github.com/Beyondtech-ID/ms-backbone-emoney/internal/repository"
-	"github.com/Beyondtech-ID/ms-backbone-emoney/internal/usecase"
+	"github.com/Beyondtech-ID/boiler-plate-be-api/internal/repository"
+	"github.com/Beyondtech-ID/boiler-plate-be-api/internal/usecase"
 	"go.uber.org/dig"
 )
 

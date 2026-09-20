@@ -1,8 +1,8 @@
 package di
 
 import (
-	"github.com/Beyondtech-ID/ms-backbone-emoney/configs"
-	"github.com/Beyondtech-ID/ms-backbone-emoney/configs/db"
+	"github.com/Beyondtech-ID/boiler-plate-be-api/configs"
+	"github.com/Beyondtech-ID/boiler-plate-be-api/configs/db"
 )
 
 func NewDatabase(cfg *configs.Config) (*db.Database, error) {

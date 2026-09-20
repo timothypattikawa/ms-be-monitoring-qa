@@ -1,9 +1,9 @@
 package shared
 
 import (
-	"github.com/Beyondtech-ID/ms-backbone-emoney/configs"
-	"github.com/Beyondtech-ID/ms-backbone-emoney/configs/db"
-	"github.com/Beyondtech-ID/ms-backbone-emoney/internal/shared/log"
+	"github.com/Beyondtech-ID/boiler-plate-be-api/configs"
+	"github.com/Beyondtech-ID/boiler-plate-be-api/configs/db"
+	"github.com/Beyondtech-ID/boiler-plate-be-api/internal/shared/log"
 	"go.uber.org/dig"
 )
 
