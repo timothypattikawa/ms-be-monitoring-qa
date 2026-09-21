@@ -13,7 +13,7 @@ var ErrNotFound = gorm.ErrRecordNotFound
 var ErrQaseProjectMapped = errors.New("qase project already mapped")
 
 type Project struct {
-	ID              string     `gorm:"primaryKey;type:uuid" json:"id"`
+	ID              string     `gorm:"primaryKey" json:"id"`
 	JiraInitID      string     `gorm:"uniqueIndex" json:"jiraInitId"`
 	JiraInitKey     string     `gorm:"index" json:"jiraInitKey"`
 	Name            string     `json:"name"`
@@ -27,21 +27,21 @@ type Project struct {
 	UpdatedAt       time.Time  `json:"-"`
 }
 type Member struct {
-	ID                  string  `gorm:"primaryKey;type:uuid" json:"id"`
+	ID                  string  `gorm:"primaryKey" json:"id"`
 	Name                string  `json:"name"`
 	JiraAccountID       string  `gorm:"index" json:"jiraAccountId"`
 	QaseMemberID        string  `gorm:"index" json:"qaseMemberId"`
 	WeeklyCapacityHours float64 `json:"weeklyCapacityHours"`
 }
 type Allocation struct {
-	ID           string    `gorm:"primaryKey;type:uuid"`
+	ID           string    `gorm:"primaryKey"`
 	ProjectID    string    `gorm:"index"`
 	MemberID     string    `gorm:"index"`
 	WeekStart    time.Time `gorm:"index"`
 	PlannedHours float64
 }
 type JiraIssue struct {
-	ID              string     `gorm:"primaryKey;type:uuid" json:"id"`
+	ID              string     `gorm:"primaryKey" json:"id"`
 	ExternalID      string     `gorm:"uniqueIndex" json:"jiraIssueId"`
 	Key             string     `gorm:"index" json:"key"`
 	ProjectID       string     `gorm:"index" json:"projectId"`
@@ -56,14 +56,14 @@ type JiraIssue struct {
 	FetchedAt       time.Time  `json:"-"`
 }
 type QaseCase struct {
-	ID          string `gorm:"primaryKey;type:uuid"`
+	ID          string `gorm:"primaryKey"`
 	ProjectCode string `gorm:"uniqueIndex:ux_case"`
 	CaseID      int64  `gorm:"uniqueIndex:ux_case"`
 	Title       string
 	UpdatedAt   time.Time
 }
 type QaseRun struct {
-	ID          string `gorm:"primaryKey;type:uuid"`
+	ID          string `gorm:"primaryKey"`
 	ProjectCode string `gorm:"uniqueIndex:ux_run"`
 	RunID       int64  `gorm:"uniqueIndex:ux_run"`
 	Title       string
@@ -75,13 +75,13 @@ type QaseRun struct {
 	FetchedAt   time.Time
 }
 type QaseRunCase struct {
-	ID          string `gorm:"primaryKey;type:uuid"`
+	ID          string `gorm:"primaryKey"`
 	ProjectCode string `gorm:"uniqueIndex:ux_run_case"`
 	RunID       int64  `gorm:"uniqueIndex:ux_run_case"`
 	CaseID      int64  `gorm:"uniqueIndex:ux_run_case"`
 }
 type QaseResult struct {
-	ID               string `gorm:"primaryKey;type:uuid"`
+	ID               string `gorm:"primaryKey"`
 	ProjectCode      string `gorm:"uniqueIndex:ux_result"`
 	ResultID         string `gorm:"uniqueIndex:ux_result"`
 	RunID            int64  `gorm:"index"`
@@ -96,7 +96,7 @@ type QaseResult struct {
 	FetchedAt        time.Time
 }
 type SyncJob struct {
-	ID          string     `gorm:"primaryKey;type:uuid" json:"id"`
+	ID          string     `gorm:"primaryKey" json:"id"`
 	RequestKey  string     `gorm:"uniqueIndex" json:"-"`
 	Trigger     string     `json:"trigger"`
 	Status      string     `gorm:"index" json:"status"`
@@ -110,7 +110,7 @@ type SyncJob struct {
 	Actor       string     `json:"-"`
 }
 type SyncStep struct {
-	ID         string     `gorm:"primaryKey;type:uuid" json:"id"`
+	ID         string     `gorm:"primaryKey" json:"id"`
 	JobID      string     `gorm:"index" json:"-"`
 	Source     string     `json:"source"`
 	Status     string     `json:"status"`
@@ -123,7 +123,7 @@ type SyncStep struct {
 	FinishedAt *time.Time `json:"finishedAt"`
 }
 type SyncEvent struct {
-	ID         string    `gorm:"primaryKey;type:uuid" json:"id"`
+	ID         string    `gorm:"primaryKey" json:"id"`
 	JobID      string    `gorm:"index" json:"-"`
 	StepID     string    `json:"stepId,omitempty"`
 	OccurredAt time.Time `gorm:"index" json:"occurredAt"`
@@ -132,7 +132,7 @@ type SyncEvent struct {
 	Message    string    `json:"message"`
 }
 type SyncCursor struct {
-	ID        string `gorm:"primaryKey;type:uuid"`
+	ID        string `gorm:"primaryKey"`
 	Source    string `gorm:"uniqueIndex:ux_cursor"`
 	ScopeKey  string `gorm:"uniqueIndex:ux_cursor"`
 	Resource  string `gorm:"uniqueIndex:ux_cursor"`
