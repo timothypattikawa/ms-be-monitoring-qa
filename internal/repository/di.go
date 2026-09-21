@@ -1,12 +1,15 @@
 package repository
 
-import "go.uber.org/dig"
+import (
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/configs/db"
+	"go.uber.org/dig"
+)
 
 type Dependency struct {
 	dig.In
+	Monitoring *Monitoring
 }
 
-func Register(container *dig.Container) error {
+func NewMonitoring(database *db.Database) *Monitoring { return &Monitoring{db: database.DB} }
 
-	return nil
-}
+func Register(container *dig.Container) error { return container.Provide(NewMonitoring) }

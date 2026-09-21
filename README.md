@@ -12,14 +12,9 @@ durable Jira/Qase sync are implemented under `/api/v1`.
 Run PostgreSQL and Redis, then start two processes:
 
 ```bash
-psql -d ms-monitoring-qa-be-local -f migrations/000001_create_monitoring_tables.up.sql
 go run ./cmd
 go run ./cmd/worker
 ```
-
-The SQL migration is the reviewable source of truth for the 12 monitoring
-tables. The API also runs GORM `AutoMigrate` on startup as a local development
-safety net.
 
 The API uses the existing `.env` settings (`APP_HOST=127.0.0.1`,
 `APP_PORT=3002` locally). The worker claims PostgreSQL jobs with

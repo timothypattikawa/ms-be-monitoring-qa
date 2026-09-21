@@ -8,18 +8,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/repository"
 	"github.com/google/uuid"
-	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 type Worker struct {
-	DB        *gorm.DB
+	Repo      *repository.Monitoring
 	Connector Connector
 }
 
 func (w Worker) Run(ctx context.Context) error {
-	if err := w.DB.AutoMigrate(Models()...); err != nil {
+	if err := w.Repo.AutoMigrate(); err != nil {
 		return err
 	}
 	ticker := time.NewTicker(5 * time.Second)
@@ -50,28 +49,7 @@ func (w Worker) Run(ctx context.Context) error {
 }
 
 func (w Worker) failExhausted(now time.Time) error {
-	return w.DB.Transaction(func(tx *gorm.DB) error {
-		var jobs []SyncJob
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
-			Where("status = ? AND heartbeat_at < ? AND attempts >= ?", "running", now.Add(-10*time.Minute), 3).
-			Find(&jobs).Error; err != nil {
-			return err
-		}
-		for _, job := range jobs {
-			if err := tx.Model(&SyncStep{}).Where("job_id = ? AND status <> ?", job.ID, "succeeded").Updates(map[string]any{
-				"status": "failed", "error_code": "WORKER_RETRY_EXHAUSTED", "finished_at": now,
-			}).Error; err != nil {
-				return err
-			}
-			if err := tx.Model(&job).Updates(map[string]any{"status": "failed", "finished_at": now}).Error; err != nil {
-				return err
-			}
-			if err := tx.Create(&SyncEvent{ID: uuid.NewString(), JobID: job.ID, OccurredAt: now, Level: "error", Code: "WORKER_RETRY_EXHAUSTED", Message: "Worker stopped after three interrupted attempts"}).Error; err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	return w.Repo.FailExhausted(now)
 }
 func (w Worker) enqueueScheduled(now time.Time) error {
 	loc, err := time.LoadLocation("Asia/Jakarta")
@@ -84,43 +62,11 @@ func (w Worker) enqueueScheduled(now time.Time) error {
 	}
 	key := fmt.Sprintf("scheduled:%s:%02d", local.Format("2006-01-02"), local.Hour())
 	job := SyncJob{ID: uuid.NewString(), RequestKey: key, Trigger: "scheduled", Status: "queued", Sources: "jira,qase", RequestedAt: now.UTC(), Actor: "scheduler"}
-	return w.DB.Transaction(func(tx *gorm.DB) error {
-		result := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "request_key"}}, DoNothing: true}).Create(&job)
-		if result.Error != nil {
-			return result.Error
-		}
-		if result.RowsAffected == 0 {
-			return nil
-		}
-		for _, source := range []string{"jira", "qase"} {
-			if err := tx.Create(&SyncStep{ID: uuid.NewString(), JobID: job.ID, Source: source, Status: "queued"}).Error; err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	_, err = w.Repo.EnqueueIfAbsent(&job, []string{"jira", "qase"})
+	return err
 }
 func (w Worker) claim() (*SyncJob, error) {
-	var job SyncJob
-	err := w.DB.Transaction(func(tx *gorm.DB) error {
-		err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where("status = ? OR (status = ? AND heartbeat_at < ? AND attempts < 3)", "queued", "running", time.Now().UTC().Add(-10*time.Minute)).Order("requested_at").First(&job).Error
-		if err != nil {
-			return err
-		}
-		now := time.Now().UTC()
-		job.Status = "running"
-		job.StartedAt = &now
-		job.HeartbeatAt = &now
-		job.Attempts++
-		return tx.Save(&job).Error
-	})
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &job, nil
+	return w.Repo.ClaimJob(time.Now().UTC())
 }
 func (w Worker) process(ctx context.Context, job SyncJob) error {
 	heartbeatDone := make(chan struct{})
@@ -133,15 +79,15 @@ func (w Worker) process(ctx context.Context, job SyncJob) error {
 			case <-heartbeatDone:
 				return
 			case <-ticker.C:
-				w.DB.Model(&SyncJob{}).Where("id = ? AND status = ?", job.ID, "running").Update("heartbeat_at", time.Now().UTC())
+				_ = w.Repo.UpdateHeartbeat(job.ID, time.Now().UTC())
 			}
 		}
 	}()
 	if err := w.event(job.ID, "", "info", "SYNC_STARTED", "Sync started"); err != nil {
 		return err
 	}
-	var steps []SyncStep
-	if err := w.DB.Where("job_id = ?", job.ID).Find(&steps).Error; err != nil {
+	steps, err := w.Repo.JobSteps(job.ID)
+	if err != nil {
 		return err
 	}
 	success := 0
@@ -153,7 +99,7 @@ func (w Worker) process(ctx context.Context, job SyncJob) error {
 		now := time.Now().UTC()
 		step.Status = "running"
 		step.StartedAt = &now
-		if err := w.DB.Save(&step).Error; err != nil {
+		if err := w.Repo.SaveStep(&step); err != nil {
 			return err
 		}
 		if err := w.event(job.ID, step.ID, "info", strings.ToUpper(step.Source)+"_STARTED", "Source import started"); err != nil {
@@ -185,10 +131,10 @@ func (w Worker) process(ctx context.Context, job SyncJob) error {
 				return eventErr
 			}
 		}
-		if err := w.DB.Save(&step).Error; err != nil {
+		if err := w.Repo.SaveStep(&step); err != nil {
 			return err
 		}
-		if err := w.DB.Model(&job).Updates(map[string]any{"heartbeat_at": finished}).Error; err != nil {
+		if err := w.Repo.UpdateHeartbeat(job.ID, finished); err != nil {
 			return err
 		}
 	}
@@ -199,7 +145,7 @@ func (w Worker) process(ctx context.Context, job SyncJob) error {
 	} else if success > 0 {
 		job.Status = "partial"
 	}
-	if err := w.DB.Save(&job).Error; err != nil {
+	if err := w.Repo.SaveJob(&job); err != nil {
 		return err
 	}
 	return w.event(job.ID, "", "info", "SYNC_"+strings.ToUpper(job.Status), "Sync completed")
@@ -214,7 +160,7 @@ func safeCode(err error) string {
 	}
 }
 func (w Worker) event(jobID, stepID, level, code, msg string) error {
-	return w.DB.Create(&SyncEvent{ID: uuid.NewString(), JobID: jobID, StepID: stepID, OccurredAt: time.Now().UTC(), Level: level, Code: code, Message: msg}).Error
+	return w.Repo.Event(&SyncEvent{ID: uuid.NewString(), JobID: jobID, StepID: stepID, OccurredAt: time.Now().UTC(), Level: level, Code: code, Message: msg})
 }
 func (w Worker) syncJira(ctx context.Context, job *SyncJob, step *SyncStep) error {
 	newest := time.Time{}
@@ -226,12 +172,11 @@ func (w Worker) syncJira(ctx context.Context, job *SyncJob, step *SyncStep) erro
 			if updated != nil && updated.After(newest) {
 				newest = *updated
 			}
-			var existing JiraIssue
-			err := w.DB.Where("external_id = ?", item.ID).First(&existing).Error
-			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			existing, found, err := w.Repo.JiraIssue(item.ID)
+			if err != nil {
 				return err
 			}
-			if errors.Is(err, gorm.ErrRecordNotFound) {
+			if !found {
 				existing = JiraIssue{ID: uuid.NewString(), ExternalID: item.ID}
 				step.Inserted++
 			} else {
@@ -251,12 +196,12 @@ func (w Worker) syncJira(ctx context.Context, job *SyncJob, step *SyncStep) erro
 					ID string `json:"id"`
 				}){link.InwardIssue, link.OutwardIssue} {
 					if target != nil {
-						var related Project
-						err := w.DB.Where("jira_init_id = ?", target.ID).First(&related).Error
-						if err == nil {
-							existing.ProjectID = related.ID
-						} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+						related, found, err := w.Repo.ProjectByJiraID(target.ID)
+						if err != nil {
 							return err
+						}
+						if found {
+							existing.ProjectID = related.ID
 						}
 					}
 				}
@@ -264,28 +209,25 @@ func (w Worker) syncJira(ctx context.Context, job *SyncJob, step *SyncStep) erro
 			if existing.Severity == "" {
 				existing.Severity = "Unknown"
 			}
-			if err := w.DB.Save(&existing).Error; err != nil {
+			if err := w.Repo.SaveJiraIssue(&existing); err != nil {
 				return err
 			}
 			// The approved JQL selects active INIT project issues. Create an unmapped project
 			// so Qase scope can be attached explicitly instead of inferred from a title.
 			if projects {
 				activeIDs = append(activeIDs, item.ID)
-				var p Project
-				err := w.DB.Where("jira_init_id = ?", item.ID).First(&p).Error
-				if errors.Is(err, gorm.ErrRecordNotFound) {
+				p, found, err := w.Repo.ProjectByJiraID(item.ID)
+				if err != nil {
+					return err
+				}
+				if !found {
 					p = Project{ID: uuid.NewString(), JiraInitID: item.ID, JiraInitKey: item.Key, Name: item.Fields.Summary, Status: item.Fields.Status.Name, Health: "unknown"}
-					if err := w.DB.Create(&p).Error; err != nil {
-						return err
-					}
-				} else if err == nil {
+				} else {
 					p.JiraInitKey = item.Key
 					p.Name = item.Fields.Summary
 					p.Status = item.Fields.Status.Name
-					if err := w.DB.Save(&p).Error; err != nil {
-						return err
-					}
-				} else {
+				}
+				if err := w.Repo.SaveProject(&p); err != nil {
 					return err
 				}
 			}
@@ -296,11 +238,7 @@ func (w Worker) syncJira(ctx context.Context, job *SyncJob, step *SyncStep) erro
 	if err != nil {
 		return err
 	}
-	inactive := w.DB.Model(&Project{}).Where("jira_init_id <> ''")
-	if len(activeIDs) > 0 {
-		inactive = inactive.Where("jira_init_id NOT IN ?", activeIDs)
-	}
-	if err := inactive.Update("status", "inactive").Error; err != nil {
+	if err := w.Repo.MarkInactiveProjects(activeIDs); err != nil {
 		return err
 	}
 	if w.Connector.JiraBugJQL != "" {
@@ -311,12 +249,8 @@ func (w Worker) syncJira(ctx context.Context, job *SyncJob, step *SyncStep) erro
 	return w.cursor("jira", "global", "issues", newest)
 }
 func (w Worker) syncQase(ctx context.Context, job *SyncJob, step *SyncStep) error {
-	var projects []Project
-	q := w.DB.Model(&Project{}).Where("qase_project_code <> ''")
-	if job.ProjectID != "" {
-		q = q.Where("id = ?", job.ProjectID)
-	}
-	if err := q.Find(&projects).Error; err != nil {
+	projects, err := w.Repo.QaseProjects(job.ProjectID)
+	if err != nil {
 		return err
 	}
 	codes := map[string]bool{}
@@ -402,78 +336,49 @@ func (w Worker) syncQaseProject(ctx context.Context, code string, step *SyncStep
 	return nil
 }
 func (w Worker) replaceRunCases(code string, runID int64, caseIDs []int64) error {
-	return w.DB.Transaction(func(tx *gorm.DB) error {
-		q := tx.Where("project_code = ? AND run_id = ?", code, runID)
-		if len(caseIDs) > 0 {
-			q = q.Where("case_id NOT IN ?", caseIDs)
-		}
-		if err := q.Delete(&QaseRunCase{}).Error; err != nil {
-			return err
-		}
-		for _, caseID := range caseIDs {
-			if caseID <= 0 {
-				return errors.New("QASE_RUN_CASES_INVALID")
-			}
-			link := QaseRunCase{ID: uuid.NewString(), ProjectCode: code, RunID: runID, CaseID: caseID}
-			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "project_code"}, {Name: "run_id"}, {Name: "case_id"}}, DoNothing: true}).Create(&link).Error; err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	return w.Repo.ReplaceRunCases(code, runID, caseIDs)
 }
 func (w Worker) upsertCase(row *QaseCase, step *SyncStep) error {
-	var old QaseCase
-	err := w.DB.Where("project_code = ? AND case_id = ?", row.ProjectCode, row.CaseID).First(&old).Error
-	if err == nil {
-		row.ID = old.ID
-		step.Updated++
-	} else if errors.Is(err, gorm.ErrRecordNotFound) {
-		step.Inserted++
-	} else {
+	existed, err := w.Repo.UpsertCase(row)
+	if err != nil {
 		return err
 	}
-	return w.DB.Save(row).Error
+	if existed {
+		step.Updated++
+	} else {
+		step.Inserted++
+	}
+	return nil
 }
 func (w Worker) upsertRun(row *QaseRun, step *SyncStep) error {
-	var old QaseRun
-	err := w.DB.Where("project_code = ? AND run_id = ?", row.ProjectCode, row.RunID).First(&old).Error
-	if err == nil {
-		row.ID = old.ID
-		step.Updated++
-	} else if errors.Is(err, gorm.ErrRecordNotFound) {
-		step.Inserted++
-	} else {
+	existed, err := w.Repo.UpsertRun(row)
+	if err != nil {
 		return err
 	}
-	return w.DB.Save(row).Error
+	if existed {
+		step.Updated++
+	} else {
+		step.Inserted++
+	}
+	return nil
 }
 func (w Worker) upsertResult(row *QaseResult, step *SyncStep) error {
-	var old QaseResult
-	err := w.DB.Where("project_code = ? AND result_id = ?", row.ProjectCode, row.ResultID).First(&old).Error
-	if err == nil {
-		row.ID = old.ID
-		step.Updated++
-	} else if errors.Is(err, gorm.ErrRecordNotFound) {
-		step.Inserted++
-	} else {
+	existed, err := w.Repo.UpsertResult(row)
+	if err != nil {
 		return err
 	}
-	return w.DB.Save(row).Error
+	if existed {
+		step.Updated++
+	} else {
+		step.Inserted++
+	}
+	return nil
 }
 func (w Worker) cursor(source, scope, resource string, watermark time.Time) error {
 	if watermark.IsZero() {
 		watermark = time.Now().UTC()
 	}
-	var row SyncCursor
-	err := w.DB.Where("source=? AND scope_key=? AND resource=?", source, scope, resource).First(&row).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		row = SyncCursor{ID: uuid.NewString(), Source: source, ScopeKey: scope, Resource: resource}
-	} else if err != nil {
-		return err
-	}
-	row.Watermark = watermark
-	return w.DB.Save(&row).Error
+	return w.Repo.SaveCursor(source, scope, resource, watermark)
 }
 func number(m map[string]json.RawMessage, key string) int64 {
 	var n int64

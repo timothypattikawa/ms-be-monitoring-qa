@@ -14,6 +14,7 @@ import (
 	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/controller"
 	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/di"
 	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/monitoring"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/repository"
 	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/shared"
 	otelshared "github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/shared/otel"
 	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/usecase"
@@ -59,6 +60,7 @@ func main() {
 			deps shared.Dependency,
 			ctrl controller.Dependency,
 			uc usecase.Dependency,
+			repos repository.Dependency,
 		) error {
 			cfg := configs.GetConfig()
 
@@ -107,10 +109,10 @@ func main() {
 			e.Use(otelshared.NewMetricsMiddleware(otelMetrics, otelSkipper))
 
 			ctrl.SetupEchoRoutes(e)
-			if err := deps.ORM.DB.AutoMigrate(monitoring.Models()...); err != nil {
+			if err := repos.Monitoring.AutoMigrate(); err != nil {
 				return err
 			}
-			monitoring.API{DB: deps.ORM.DB}.Register(e)
+			monitoring.API{Repo: repos.Monitoring}.Register(e)
 
 			go func() {
 				addr := cfg.AppConfig.Host + ":" + cfg.AppConfig.Port
