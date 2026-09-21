@@ -3,7 +3,7 @@
 package db
 
 import (
-	"github.com/Beyondtech-ID/boiler-plate-be-api/configs"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/configs"
 	"gorm.io/driver/postgres"
 
 	//nolint:typecheck
@@ -18,7 +18,7 @@ type Database struct {
 	DB *gorm.DB
 }
 
-func NewPostgreDB(conf configs.Config, isDbLog bool, opts ...Option) *Database {
+func NewPostgreDB(conf configs.Config, isDbLog bool, opts ...Option) (*Database, error) {
 	var DB *gorm.DB
 	var err error
 	option := NewDefaultOption()
@@ -63,10 +63,12 @@ func NewPostgreDB(conf configs.Config, isDbLog bool, opts ...Option) *Database {
 		},
 	)
 	if err != nil {
+		return nil, err
 	}
 
 	dbSQL, err := DB.DB()
 	if err != nil {
+		return nil, err
 	}
 
 	//Database Connection Pool
@@ -76,16 +78,15 @@ func NewPostgreDB(conf configs.Config, isDbLog bool, opts ...Option) *Database {
 
 	err = dbSQL.Ping()
 	if err != nil {
+		return nil, err
 	} else {
 		go doEvery(10*time.Minute, pingDb, DB)
 		return &Database{
 			DB: DB,
-		}
+		}, nil
 	}
 
-	return &Database{
-		DB: DB,
-	}
+	return nil, fmt.Errorf("database unavailable")
 }
 
 func doEvery(d time.Duration, f func(*gorm.DB), x *gorm.DB) {

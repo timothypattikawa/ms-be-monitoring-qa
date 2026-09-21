@@ -7,12 +7,12 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/Beyondtech-ID/boiler-plate-be-api/configs"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/configs"
 	"github.com/joomcode/errorx"
 )
 
 var (
-	ErrNamespace        = errorx.NewNamespace("boiler-plate-be-api")
+	ErrNamespace        = errorx.NewNamespace("ms-monitoring-qa-be")
 	ErrCodeProperty     = errorx.RegisterProperty("code")
 	ErrHttpCodeProperty = errorx.RegisterProperty("httpcode")
 	ErrCause            = errorx.RegisterProperty("cause")

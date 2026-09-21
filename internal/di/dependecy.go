@@ -3,7 +3,7 @@ package di
 import (
 	"sync"
 
-	"github.com/Beyondtech-ID/boiler-plate-be-api/configs"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/configs"
 	"go.uber.org/dig"
 )
 

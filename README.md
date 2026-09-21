@@ -1,11 +1,83 @@
-# boiler-plate-be-api
+# ms-monitoring-qa-be
 
-Beyondtech's backend service boilerplate (Go + Echo, layered architecture).
+Go + Echo starter for the Alfagift QA Monitoring backend.
 Already wired up: **Postgres** (GORM), **Redis** (cache), **OpenTelemetry**
 (tracing + metrics), and an **error contract** (consistent error response format).
 
-This repo isn't meant to run as-is — clone/fork it, then follow the
-"Adapting to a New Service" guide below before writing any feature code.
+The service identity is set to `ms-monitoring-qa-be`. Dashboard reads and
+durable Jira/Qase sync are implemented under `/api/v1`.
+
+## QA Monitoring API and worker
+
+Run PostgreSQL and Redis, then start two processes:
+
+```bash
+psql -d ms-monitoring-qa-be-local -f migrations/000001_create_monitoring_tables.up.sql
+go run ./cmd
+go run ./cmd/worker
+```
+
+The SQL migration is the reviewable source of truth for the 12 monitoring
+tables. The API also runs GORM `AutoMigrate` on startup as a local development
+safety net.
+
+The API uses the existing `.env` settings (`APP_HOST=127.0.0.1`,
+`APP_PORT=3002` locally). The worker claims PostgreSQL jobs with
+`FOR UPDATE SKIP LOCKED`; it enqueues scheduled jobs at 08:00 and 17:00
+Asia/Jakarta. `POST /api/v1/sync-jobs` enqueues a manual job and requires
+`X-Manager-Key` matching `MONITOR_MANAGER_API_KEY`. If that variable is
+unset, manager writes are disabled. Keep this key server side; replace this
+temporary gate with the organization's authenticated manager identity before
+production. Dashboard reads also need identity based access control before
+production.
+
+Set these only in runtime secrets/environment, never in Angular or Git:
+
+| Variable | Value |
+| --- | --- |
+| `JIRA_BASE_URL` | Jira Cloud site origin, such as `https://example.atlassian.net` |
+| `JIRA_EMAIL` | Jira account used for Basic auth |
+| `JIRA_API_TOKEN` | Jira API token for that account |
+| `JIRA_ACTIVE_JQL` | Approved active INIT JQL; the supplied QA filtered JQL may be used temporarily |
+| `JIRA_BUG_JQL` | Approved JQL for linked bug issues; unset means Bugs remains empty |
+| `QASE_API_TOKEN` | Read token sent in Qase's `Token` header |
+| `QASE_BASE_URL` | Optional; defaults to `https://api.qase.io` |
+| `MONITOR_MANAGER_API_KEY` | Temporary manager write gate |
+
+Load the approved JQL directly from the supplied file at runtime. Quoting the
+path is required because its filename contains spaces and parentheses:
+
+```bash
+export JIRA_ACTIVE_JQL="$(cat '/absolute/path/project = INIT AND status not in (C.txt')"
+go run ./cmd/worker
+```
+
+This keeps the query out of shell history, source files, and committed `.env`
+files. The Jira base URL, bug mapping JQL, and INIT-to-Qase project codes are
+still required before a real sync can be complete.
+
+**Required mapping:** Each Jira INIT needs a verified Qase project code in
+`projects.qase_project_code`. Jira issue links or an approved field must
+connect bugs to an INIT. The attached JQL filters to one QA account; confirm
+whether that is the intended dashboard scope before treating its counts as
+team wide. A Qase run title such as `[STG] AOS` supplies a platform label;
+environment is a separate stored field. The worker does not invent an
+INIT ↔ Qase mapping from names. Project counts are marked
+`countsAvailable=false` until run membership and a unique mapping exist.
+
+`GET /api/v1/projects`, `/workflow`, `/workload`, `/bugs`, `/sync-jobs`, and
+`/sync-jobs/{id}` return `{asOf,sources,data}`. Source status is `fresh`,
+`stale`, or `never_synced`; staleness currently means older than 24 hours.
+`POST /api/v1/projects` saves/updates a mapping and enqueues validation;
+`POST /api/v1/sync-jobs` returns `202` and a job with steps/events. Qase
+backfill pages cases, runs, run membership and results at 100 records per
+request. Run membership is reconciled on each sync; malformed or incomplete
+pages fail the job with a visible error code instead of producing partial
+counts. The worker upserts by source identity, so retries do not duplicate
+records. It performs a full source reconciliation on every sync until the
+tenant's Qase result timestamp timezone and Jira bug mapping are verified;
+watermarks are stored for the later incremental path. Qase's 100,000 offset
+limit currently causes a safe job failure rather than silently dropping data.
 
 ## Tech Stack
 
@@ -45,14 +117,23 @@ errorContract.json               # source of error codes for errcntrct
 Prerequisites: Go 1.25+, PostgreSQL, Redis.
 
 ```bash
-git clone git@github.com:Beyondtech-ID/<new-service-name>.git
-cd <new-service-name>
 cp .env .env.local   # or edit .env directly with your local credentials
 go mod download
 go run cmd/main.go
 ```
 
 Check it's running: `GET /health` — it also pings the DB, not just a static "OK".
+
+Current identity: Go module `github.com/Beyondtech-ID/ms-monitoring-qa-be`,
+application/OTel service `ms-monitoring-qa-be`, Jenkins image
+`ms-monitoring-qa-be`, and local database `ms-monitoring-qa-be-local`.
+The Git remote still points to the original boilerplate repository; update it
+when the new remote exists.
+
+`errorContract.json` still contains boilerplate example codes; define real QA
+Monitoring error codes when the first business endpoints are added. The CDK
+stack under `infra/` still carries the old BackboneDoku identity and must be
+reviewed before any deployment.
 
 ## Adapting to a New Service
 
@@ -61,7 +142,7 @@ the following. Everything is a find-and-replace — no logic needs to be rewritt
 
 1. **Module path (`go.mod`)**
    ```bash
-   OLD="github.com/Beyondtech-ID/boiler-plate-be-api"
+   OLD="github.com/Beyondtech-ID/ms-monitoring-qa-be"
    NEW="github.com/Beyondtech-ID/<new-service-name>"
    grep -rl "$OLD" --include="*.go" . | xargs sed -i '' "s#$OLD#$NEW#g"
    sed -i '' "s#^module $OLD#module $NEW#" go.mod
@@ -107,7 +188,7 @@ Every business error should be created with `errors.New`, not a plain
 extracted automatically into the response.
 
 ```go
-import "github.com/Beyondtech-ID/boiler-plate-be-api/internal/shared/errors"
+import "github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/shared/errors"
 
 // define errors as package-level vars (same pattern already in errors.go)
 var ErrAccountNotFound = errors.New(http.StatusNotFound, "21-01", "account not found")
@@ -178,7 +259,7 @@ inject it, no need to build your own Redis client. Cache errors (`ErrSetCache`,
   alias (it shares its name with `go.opentelemetry.io/otel`) and use the
   tracer singleton:
   ```go
-  import otelshared "github.com/Beyondtech-ID/boiler-plate-be-api/internal/shared/otel"
+  import otelshared "github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/shared/otel"
 
   ctx, span := otelshared.Tracer.Start(ctx, "usecase.DoSomething")
   defer span.End()

@@ -5,8 +5,8 @@ import (
 	"crypto/tls"
 	"time"
 
-	"github.com/Beyondtech-ID/boiler-plate-be-api/internal/shared/cache"
-	"github.com/Beyondtech-ID/boiler-plate-be-api/internal/shared/errors"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/shared/cache"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/shared/errors"
 	redis "github.com/go-redis/redis/v8"
 )
 

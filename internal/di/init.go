@@ -1,8 +1,8 @@
 package di
 
 import (
-	"github.com/Beyondtech-ID/boiler-plate-be-api/internal/repository"
-	"github.com/Beyondtech-ID/boiler-plate-be-api/internal/usecase"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/repository"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/usecase"
 	"go.uber.org/dig"
 )
 

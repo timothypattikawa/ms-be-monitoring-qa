@@ -1,9 +1,9 @@
 package shared
 
 import (
-	"github.com/Beyondtech-ID/boiler-plate-be-api/configs"
-	"github.com/Beyondtech-ID/boiler-plate-be-api/configs/db"
-	"github.com/Beyondtech-ID/boiler-plate-be-api/internal/shared/log"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/configs"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/configs/db"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/shared/log"
 	"go.uber.org/dig"
 )
 

@@ -1,1 +1,0 @@
-{"level":"fatal","timestamp":"2025-12-08T13:57:57.608+0700","msg":"failed running echo server","error":"listen tcp 127.0.0.1:3002: bind: address already in use"}

@@ -1,0 +1,12 @@
+DROP TABLE IF EXISTS sync_cursors;
+DROP TABLE IF EXISTS sync_events;
+DROP TABLE IF EXISTS sync_steps;
+DROP TABLE IF EXISTS sync_jobs;
+DROP TABLE IF EXISTS qase_results;
+DROP TABLE IF EXISTS qase_run_cases;
+DROP TABLE IF EXISTS qase_runs;
+DROP TABLE IF EXISTS qase_cases;
+DROP TABLE IF EXISTS jira_issues;
+DROP TABLE IF EXISTS allocations;
+DROP TABLE IF EXISTS members;
+DROP TABLE IF EXISTS projects;

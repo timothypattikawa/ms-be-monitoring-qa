@@ -1,9 +1,10 @@
-module github.com/Beyondtech-ID/boiler-plate-be-api
+module github.com/Beyondtech-ID/ms-monitoring-qa-be
 
 go 1.25.0
 
 require (
 	github.com/go-redis/redis/v8 v8.11.5
+	github.com/google/uuid v1.6.0
 	github.com/joho/godotenv v1.5.1
 	github.com/joomcode/errorx v1.2.0
 	github.com/labstack/echo/v4 v4.15.2
@@ -35,7 +36,6 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect

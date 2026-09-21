@@ -3,7 +3,7 @@ pipeline {
 
     environment {
         // Ganti nama-image sesuai keinginan
-        IMAGE_NAME = "boiler-plate-api"
+        IMAGE_NAME = "ms-monitoring-qa-be"
         DOCKER_TAG = "${BUILD_NUMBER}"
     }
 

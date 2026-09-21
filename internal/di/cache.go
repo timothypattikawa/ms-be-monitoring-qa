@@ -5,9 +5,9 @@ import (
 	"crypto/x509"
 	"os"
 
-	"github.com/Beyondtech-ID/boiler-plate-be-api/configs"
-	"github.com/Beyondtech-ID/boiler-plate-be-api/internal/shared/cache"
-	rediscache "github.com/Beyondtech-ID/boiler-plate-be-api/internal/shared/cache/redis"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/configs"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/shared/cache"
+	rediscache "github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/shared/cache/redis"
 	"github.com/go-redis/redis/v8"
 )
 

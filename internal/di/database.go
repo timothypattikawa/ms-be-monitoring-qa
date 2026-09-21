@@ -1,8 +1,8 @@
 package di
 
 import (
-	"github.com/Beyondtech-ID/boiler-plate-be-api/configs"
-	"github.com/Beyondtech-ID/boiler-plate-be-api/configs/db"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/configs"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/configs/db"
 )
 
 func NewDatabase(cfg *configs.Config) (*db.Database, error) {
@@ -15,7 +15,5 @@ func NewDatabase(cfg *configs.Config) (*db.Database, error) {
 		}
 	)
 
-	database := db.NewPostgreDB(*cfg, false, opts...)
-
-	return database, nil
+	return db.NewPostgreDB(*cfg, false, opts...)
 }

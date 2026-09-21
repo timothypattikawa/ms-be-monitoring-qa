@@ -3,9 +3,9 @@ package controller
 import (
 	"net/http"
 
-	"github.com/Beyondtech-ID/boiler-plate-be-api/internal/shared"
-	"github.com/Beyondtech-ID/boiler-plate-be-api/internal/shared/delivery"
-	"github.com/Beyondtech-ID/boiler-plate-be-api/internal/usecase"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/shared"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/shared/delivery"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/usecase"
 	"github.com/labstack/echo/v4"
 )
 

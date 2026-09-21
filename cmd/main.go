@@ -10,12 +10,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Beyondtech-ID/boiler-plate-be-api/configs"
-	"github.com/Beyondtech-ID/boiler-plate-be-api/internal/controller"
-	"github.com/Beyondtech-ID/boiler-plate-be-api/internal/di"
-	"github.com/Beyondtech-ID/boiler-plate-be-api/internal/shared"
-	otelshared "github.com/Beyondtech-ID/boiler-plate-be-api/internal/shared/otel"
-	"github.com/Beyondtech-ID/boiler-plate-be-api/internal/usecase"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/configs"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/controller"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/di"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/monitoring"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/shared"
+	otelshared "github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/shared/otel"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/usecase"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/saucon/errcntrct"
@@ -97,10 +98,19 @@ func main() {
 
 			e.Use(middleware.Recover())
 			e.Use(middleware.Logger())
+			e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+				AllowOrigins: []string{"http://localhost:4200", "http://127.0.0.1:4200"},
+				AllowHeaders: []string{echo.HeaderOrigin, echo.HeaderContentType, echo.HeaderAccept, "X-Manager-Key", "Idempotency-Key"},
+				AllowMethods: []string{http.MethodGet, http.MethodPost, http.MethodOptions},
+			}))
 			e.Use(otelecho.Middleware(otelshared.ServiceName, otelecho.WithSkipper(otelSkipper)))
 			e.Use(otelshared.NewMetricsMiddleware(otelMetrics, otelSkipper))
 
 			ctrl.SetupEchoRoutes(e)
+			if err := deps.ORM.DB.AutoMigrate(monitoring.Models()...); err != nil {
+				return err
+			}
+			monitoring.API{DB: deps.ORM.DB}.Register(e)
 
 			go func() {
 				addr := cfg.AppConfig.Host + ":" + cfg.AppConfig.Port

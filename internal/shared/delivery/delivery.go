@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Beyondtech-ID/boiler-plate-be-api/internal/shared/dto"
-	"github.com/Beyondtech-ID/boiler-plate-be-api/internal/shared/errors"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/shared/dto"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/shared/errors"
 	"github.com/labstack/echo/v4"
 )
 

@@ -8,10 +8,10 @@ import (
 )
 
 // ServiceName is the process-wide service name reported to the OTel collector.
-const ServiceName = "boiler-plate-be-api"
+const ServiceName = "ms-monitoring-qa-be"
 
 // ServiceInstrumentationName identifies this module as an OTel instrumentation scope.
-const ServiceInstrumentationName = "github.com/Beyondtech-ID/boiler-plate-be-api"
+const ServiceInstrumentationName = "github.com/Beyondtech-ID/ms-monitoring-qa-be"
 
 // Tracer is the process-wide tracer singleton for every manual span in
 // usecase/integrations — obtain it only through this variable, never

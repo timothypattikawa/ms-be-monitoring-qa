@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Beyondtech-ID/boiler-plate-be-api/pkg/helper"
+	"github.com/Beyondtech-ID/ms-monitoring-qa-be/pkg/helper"
 	"github.com/joho/godotenv"
 	"github.com/spf13/viper"
 )
