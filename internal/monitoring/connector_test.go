@@ -95,6 +95,41 @@ func TestQasePagesLoadsEveryPage(t *testing.T) {
 	}
 }
 
+func TestQaseResultPagesAreScopedToRegisteredRun(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("run"); got != "77" {
+			t.Errorf("run filter = %q, want 77", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": true, "result": map[string]any{"total": 0, "entities": []any{}}})
+	}))
+	defer srv.Close()
+	x := Connector{Client: srv.Client(), QaseBaseURL: srv.URL, QaseToken: "secret"}
+	if err := x.QasePagesForRun(context.Background(), "result", "INIT", 77, func(json.RawMessage) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestQaseRunFetchesSelectedRunDirectly(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/run/INIT/77" || r.URL.Query().Get("include") != "cases" {
+			t.Errorf("unexpected selected-run request: %s", r.URL.String())
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": true, "result": map[string]any{"id": 77, "cases": []int{1, 2}}})
+	}))
+	defer srv.Close()
+	x := Connector{Client: srv.Client(), QaseBaseURL: srv.URL, QaseToken: "secret"}
+	raw, err := x.QaseRun(context.Background(), "INIT", 77)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var run struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &run); err != nil || run.ID != 77 {
+		t.Fatalf("unexpected selected run: id=%d err=%v", run.ID, err)
+	}
+}
+
 func TestJiraNextPageToken(t *testing.T) {
 	requests := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -141,5 +176,73 @@ func TestRunPlatformKeepsEnvironmentSeparate(t *testing.T) {
 		if got := runPlatform(title); got != want {
 			t.Errorf("%s: got %s, want %s", title, got, want)
 		}
+	}
+}
+
+func TestJiraIssueFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/rest/api/3/issue/INIT-2401" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"10042","key":"INIT-2401","fields":{"summary":"Checkout revamp","status":{"name":"In Progress"},"issuetype":{"name":"Initiative"}}}`))
+	}))
+	defer srv.Close()
+	x := Connector{Client: srv.Client(), JiraBaseURL: srv.URL, JiraEmail: "qa@example.com", JiraToken: "token"}
+	issue, err := x.JiraIssue(context.Background(), "INIT-2401")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if issue.ID != "10042" || issue.Key != "INIT-2401" {
+		t.Fatalf("unexpected issue: %+v", issue)
+	}
+}
+
+func TestJiraIssueNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	x := Connector{Client: srv.Client(), JiraBaseURL: srv.URL, JiraEmail: "qa@example.com", JiraToken: "token"}
+	if _, err := x.JiraIssue(context.Background(), "INIT-9999"); err == nil {
+		t.Fatal("expected an error for a missing issue")
+	}
+}
+
+func TestJiraIssueConfigMissing(t *testing.T) {
+	x := Connector{}
+	if _, err := x.JiraIssue(context.Background(), "INIT-2401"); err == nil || err.Error() != "JIRA_CONFIG_MISSING" {
+		t.Fatalf("expected JIRA_CONFIG_MISSING, got %v", err)
+	}
+}
+
+func TestQaseProjectFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/project/PAY" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":true,"result":{"code":"PAY","title":"Payments"}}`))
+	}))
+	defer srv.Close()
+	x := Connector{Client: srv.Client(), QaseBaseURL: srv.URL, QaseToken: "token"}
+	result, err := x.QaseProject(context.Background(), "PAY")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result) == 0 {
+		t.Fatal("expected a non-empty result payload")
+	}
+}
+
+func TestQaseProjectNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":false,"errorMessage":"Project not found"}`))
+	}))
+	defer srv.Close()
+	x := Connector{Client: srv.Client(), QaseBaseURL: srv.URL, QaseToken: "token"}
+	if _, err := x.QaseProject(context.Background(), "MISSING"); err == nil || err.Error() != "QASE_PROJECT_NOT_FOUND" {
+		t.Fatalf("expected QASE_PROJECT_NOT_FOUND, got %v", err)
 	}
 }

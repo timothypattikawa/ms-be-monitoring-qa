@@ -114,6 +114,51 @@ func (x Connector) JiraPages(ctx context.Context, jql string, visit func(jiraIss
 	return errors.New("JIRA_PAGE_LIMIT")
 }
 
+func (x Connector) JiraIssue(ctx context.Context, key string) (jiraIssue, error) {
+	if x.JiraBaseURL == "" || x.JiraEmail == "" || x.JiraToken == "" || key == "" {
+		return jiraIssue{}, errors.New("JIRA_CONFIG_MISSING")
+	}
+	endpoint := fmt.Sprintf("%s/rest/api/3/issue/%s?fields=summary,status,issuetype", x.JiraBaseURL, url.PathEscape(key))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return jiraIssue{}, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(x.JiraEmail+":"+x.JiraToken)))
+	var issue jiraIssue
+	if err := x.do(req, &issue); err != nil {
+		// x.do maps 404 into the same generic UPSTREAM_BAD_RESPONSE as other
+		// non-2xx statuses; a plain single-issue GET has no other 4xx cause
+		// worth distinguishing here, so treat any failure as "not found".
+		return jiraIssue{}, errors.New("JIRA_ISSUE_NOT_FOUND")
+	}
+	if issue.ID == "" {
+		return jiraIssue{}, errors.New("JIRA_ISSUE_NOT_FOUND")
+	}
+	return issue, nil
+}
+
+func (x Connector) QaseProject(ctx context.Context, code string) (json.RawMessage, error) {
+	if x.QaseToken == "" || code == "" {
+		return nil, errors.New("QASE_CONFIG_MISSING")
+	}
+	endpoint := fmt.Sprintf("%s/v1/project/%s", x.QaseBaseURL, url.PathEscape(code))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Token", x.QaseToken)
+	var env qaseEnvelope
+	if err := x.do(req, &env); err != nil {
+		return nil, errors.New("QASE_PROJECT_NOT_FOUND")
+	}
+	if !env.Status || len(env.Result) == 0 || strings.TrimSpace(string(env.Result)) == "null" {
+		return nil, errors.New("QASE_PROJECT_NOT_FOUND")
+	}
+	return env.Result, nil
+}
+
 type qaseEnvelope struct {
 	Status bool            `json:"status"`
 	Result json.RawMessage `json:"result"`
@@ -124,13 +169,17 @@ type qaseList struct {
 }
 
 func (x Connector) QasePages(ctx context.Context, resource, projectCode string, visit func(json.RawMessage) error) error {
+	return x.QasePagesForRun(ctx, resource, projectCode, 0, visit)
+}
+
+func (x Connector) QasePagesForRun(ctx context.Context, resource, projectCode string, runID int64, visit func(json.RawMessage) error) error {
 	if x.QaseToken == "" || projectCode == "" {
 		return errors.New("QASE_CONFIG_MISSING")
 	}
 	for offset := 0; offset <= 100000; offset += 100 {
 		endpoint := fmt.Sprintf("%s/v1/%s/%s?limit=100&offset=%d", x.QaseBaseURL, resource, url.PathEscape(projectCode), offset)
-		if resource == "run" {
-			endpoint += "&include=cases"
+		if resource == "result" && runID > 0 {
+			endpoint += "&run=" + strconv.FormatInt(runID, 10)
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
@@ -163,7 +212,7 @@ func (x Connector) QasePages(ctx context.Context, resource, projectCode string, 
 	}
 	return errors.New("QASE_OFFSET_LIMIT")
 }
-func (x Connector) QaseRunCases(ctx context.Context, projectCode string, runID int64) ([]int64, error) {
+func (x Connector) QaseRun(ctx context.Context, projectCode string, runID int64) (json.RawMessage, error) {
 	if x.QaseToken == "" || x.QaseBaseURL == "" || projectCode == "" || runID <= 0 {
 		return nil, errors.New("QASE_CONFIG_MISSING")
 	}
@@ -181,10 +230,20 @@ func (x Connector) QaseRunCases(ctx context.Context, projectCode string, runID i
 	if !env.Status {
 		return nil, errors.New("QASE_REJECTED")
 	}
+	if len(env.Result) == 0 || strings.TrimSpace(string(env.Result)) == "null" {
+		return nil, errors.New("QASE_RESPONSE_INVALID")
+	}
+	return env.Result, nil
+}
+func (x Connector) QaseRunCases(ctx context.Context, projectCode string, runID int64) ([]int64, error) {
+	raw, err := x.QaseRun(ctx, projectCode, runID)
+	if err != nil {
+		return nil, err
+	}
 	var result struct {
 		Cases json.RawMessage `json:"cases"`
 	}
-	if err := json.Unmarshal(env.Result, &result); err != nil {
+	if err := json.Unmarshal(raw, &result); err != nil {
 		return nil, errors.New("QASE_RESPONSE_INVALID")
 	}
 	return qaseCaseIDs(result.Cases)
