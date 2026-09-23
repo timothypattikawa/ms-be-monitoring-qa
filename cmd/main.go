@@ -95,8 +95,8 @@ func main() {
 			}
 
 			e := echo.New()
-			e.HideBanner = true
-			e.HidePort = true
+			e.HideBanner = false
+			e.HidePort = false
 
 			e.Use(middleware.Recover())
 			e.Use(middleware.Logger())
@@ -112,7 +112,7 @@ func main() {
 			if err := repos.Monitoring.AutoMigrate(); err != nil {
 				return err
 			}
-			monitoring.API{Repo: repos.Monitoring}.Register(e)
+			monitoring.API{Repo: repos.Monitoring, Connector: monitoring.NewConnector()}.Register(e)
 
 			go func() {
 				addr := cfg.AppConfig.Host + ":" + cfg.AppConfig.Port

@@ -2,6 +2,7 @@ package repository
 
 import (
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -10,19 +11,23 @@ import (
 )
 
 var ErrNotFound = gorm.ErrRecordNotFound
-var ErrQaseProjectMapped = errors.New("qase project already mapped")
+var ErrJiraInitMapped = errors.New("jira INIT is already registered")
+var ErrQaseRunMapped = errors.New("Qase run is already registered")
 
 type Project struct {
 	ID              string     `gorm:"primaryKey" json:"id"`
-	JiraInitID      string     `gorm:"uniqueIndex" json:"jiraInitId"`
-	JiraInitKey     string     `gorm:"index" json:"jiraInitKey"`
+	JiraInitID      *string    `gorm:"uniqueIndex" json:"jiraInitId,omitempty"`
+	JiraInitKey     string     `gorm:"uniqueIndex" json:"jiraInitKey"`
 	Name            string     `json:"name"`
 	Status          string     `json:"status"`
 	Health          string     `json:"health"`
 	QAOwner         string     `json:"qaOwner"`
 	QaseProjectCode string     `gorm:"index" json:"qaseProjectCode"`
-	StagingDate     *time.Time `json:"stagingDate"`
-	BetaDate        *time.Time `json:"betaDate"`
+	QaseTestRunID   int64      `gorm:"index" json:"qaseTestRunId"`
+	StagingStartAt  *time.Time `json:"stagingStartAt"`
+	StagingEndAt    *time.Time `json:"stagingEndAt"`
+	BetaStartAt     *time.Time `json:"betaStartAt"`
+	BetaEndAt       *time.Time `json:"betaEndAt"`
 	CreatedAt       time.Time  `json:"-"`
 	UpdatedAt       time.Time  `json:"-"`
 }
@@ -145,6 +150,21 @@ type Counts struct {
 	Failed  int64 `json:"failed"`
 	Blocked int64 `json:"blocked"`
 	Total   int64 `json:"total"`
+}
+type ProjectRun struct {
+	RunID          int64      `json:"runId"`
+	Title          string     `json:"title"`
+	Environment    string     `json:"environment"`
+	Platform       string     `json:"platform"`
+	Scope          string     `json:"scope"`
+	OwnerID        string     `json:"ownerId"`
+	Passed         int64      `json:"passed"`
+	Failed         int64      `json:"failed"`
+	Blocked        int64      `json:"blocked"`
+	Total          int64      `json:"total"`
+	StartedAt      *time.Time `json:"startedAt"`
+	FinishedAt     *time.Time `json:"finishedAt"`
+	ElapsedSeconds *int64     `json:"elapsedSeconds"`
 }
 type WorkflowDay struct {
 	Date      string `json:"date"`
@@ -272,6 +292,14 @@ func (r *Monitoring) ProjectByJiraID(id string) (Project, bool, error) {
 	}
 	return v, err == nil, err
 }
+func (r *Monitoring) ProjectByJiraKey(key string) (Project, bool, error) {
+	var v Project
+	err := r.db.Where("jira_init_key = ?", key).First(&v).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return v, false, nil
+	}
+	return v, err == nil, err
+}
 func (r *Monitoring) SaveProject(v *Project) error { return r.db.Save(v).Error }
 func (r *Monitoring) MarkInactiveProjects(active []string) error {
 	q := r.db.Model(&Project{}).Where("jira_init_id <> ''")
@@ -282,7 +310,7 @@ func (r *Monitoring) MarkInactiveProjects(active []string) error {
 }
 func (r *Monitoring) QaseProjects(projectID string) ([]Project, error) {
 	var v []Project
-	q := r.db.Where("qase_project_code <> ''")
+	q := r.db.Where("qase_project_code <> '' AND qase_test_run_id > 0")
 	if projectID != "" {
 		q = q.Where("id = ?", projectID)
 	}
@@ -381,71 +409,164 @@ func (r *Monitoring) ProjectCounts(p Project) (Counts, bool, error) {
 	if p.QaseProjectCode == "" {
 		return out, false, nil
 	}
+	if p.QaseTestRunID <= 0 {
+		return out, false, nil
+	}
 	var mappings, membership int64
-	if err := r.db.Model(&Project{}).Where("qase_project_code = ?", p.QaseProjectCode).Count(&mappings).Error; err != nil {
+	if err := r.db.Model(&Project{}).Where("qase_project_code = ? AND qase_test_run_id = ?", p.QaseProjectCode, p.QaseTestRunID).Count(&mappings).Error; err != nil {
 		return out, false, err
 	}
 	if mappings != 1 {
 		return out, false, nil
 	}
-	if err := r.db.Model(&QaseRunCase{}).Where("project_code = ?", p.QaseProjectCode).Count(&membership).Error; err != nil {
+	if err := r.db.Model(&QaseRunCase{}).Where("project_code = ? AND run_id = ?", p.QaseProjectCode, p.QaseTestRunID).Count(&membership).Error; err != nil {
 		return out, false, err
 	}
 	if membership == 0 {
 		return out, false, nil
 	}
-	q := `SELECT count(*) FILTER (WHERE status='passed') AS passed,count(*) FILTER (WHERE status='failed') AS failed,count(*) FILTER (WHERE status='blocked') AS blocked FROM (SELECT DISTINCT ON (r.run_id,r.case_id,r.configuration_key) r.status FROM qase_results r JOIN qase_run_cases rc ON rc.project_code=r.project_code AND rc.run_id=r.run_id AND rc.case_id=r.case_id WHERE r.project_code=? ORDER BY r.run_id,r.case_id,r.configuration_key,r.ended_at DESC NULLS LAST,r.result_id DESC) latest`
-	if err := r.db.Raw(q, p.QaseProjectCode).Scan(&out).Error; err != nil {
+	q := `SELECT count(*) FILTER (WHERE status='passed') AS passed,count(*) FILTER (WHERE status='failed') AS failed,count(*) FILTER (WHERE status='blocked') AS blocked FROM (SELECT DISTINCT ON (r.case_id) r.status FROM qase_results r JOIN qase_run_cases rc ON rc.project_code=r.project_code AND rc.run_id=r.run_id AND rc.case_id=r.case_id WHERE r.project_code=? AND r.run_id=? ORDER BY r.case_id,r.ended_at DESC NULLS LAST,r.result_id DESC) latest`
+	if err := r.db.Raw(q, p.QaseProjectCode, p.QaseTestRunID).Scan(&out).Error; err != nil {
 		return Counts{}, false, err
 	}
 	out.Total = membership
 	return out, true, nil
 }
-func (r *Monitoring) SaveProjectMapping(jiraID, jiraKey, name, code string) (Project, error) {
+func (r *Monitoring) ProjectRuns(p Project) ([]ProjectRun, error) {
+	out := make([]ProjectRun, 0, 1)
+	if p.QaseProjectCode == "" || p.QaseTestRunID <= 0 {
+		return out, nil
+	}
+	var run QaseRun
+	err := r.db.Where("project_code = ? AND run_id = ?", p.QaseProjectCode, p.QaseTestRunID).First(&run).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return out, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	counts, _, err := r.ProjectCounts(p)
+	if err != nil {
+		return nil, err
+	}
+	var latest QaseResult
+	err = r.db.Where("project_code = ? AND run_id = ?", p.QaseProjectCode, p.QaseTestRunID).
+		Order("ended_at DESC NULLS LAST, fetched_at DESC").First(&latest).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	environment := run.Environment
+	platform := run.Platform
+	ownerID := ""
+	if err == nil {
+		if environment == "" {
+			environment = latest.Environment
+		}
+		if platform == "" {
+			platform = latest.Platform
+		}
+		ownerID = latest.MemberID
+	}
+	if environment == "" {
+		title := strings.ToUpper(run.Title)
+		if strings.Contains(title, "[STG]") || strings.Contains(title, "[STAGING]") || strings.Contains(title, "[BETA]") {
+			environment = title
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(platform), "unknown") {
+		platform = ""
+	}
+	summary := ProjectRun{
+		RunID: p.QaseTestRunID, Title: run.Title, Environment: normalizeQaseEnvironment(environment),
+		Platform: strings.TrimSpace(platform), Scope: strings.TrimSpace(platform), OwnerID: ownerID,
+		Passed: counts.Passed, Failed: counts.Failed, Blocked: counts.Blocked, Total: counts.Total,
+		StartedAt: run.StartedAt, FinishedAt: run.FinishedAt,
+	}
+	if run.StartedAt != nil && run.FinishedAt != nil && !run.FinishedAt.Before(*run.StartedAt) {
+		seconds := int64(run.FinishedAt.Sub(*run.StartedAt).Seconds())
+		summary.ElapsedSeconds = &seconds
+	}
+	return append(out, summary), nil
+}
+
+func normalizeQaseEnvironment(value string) string {
+	value = strings.ToUpper(strings.TrimSpace(value))
+	switch {
+	case strings.Contains(value, "BETA"):
+		return "BETA"
+	case strings.Contains(value, "STAGING"), strings.Contains(value, "[STG]"), value == "STG", strings.HasPrefix(value, "STG "), strings.HasPrefix(value, "STG-"):
+		return "STAGING"
+	default:
+		return value
+	}
+}
+func (r *Monitoring) SaveProjectMapping(jiraKey, name, code string, runID int64, qaOwner string, stagingStart, stagingEnd, betaStart, betaEnd time.Time) (Project, error) {
 	var p Project
 	err := r.db.Transaction(func(tx *gorm.DB) error {
-		var duplicate int64
-		if err := tx.Model(&Project{}).Where("qase_project_code = ? AND jira_init_id <> ?", code, jiraID).Count(&duplicate).Error; err != nil {
-			return err
-		}
-		if duplicate > 0 {
-			return ErrQaseProjectMapped
-		}
-		err := tx.Where("jira_init_id = ?", jiraID).First(&p).Error
+		err := tx.Where("jira_init_key = ?", jiraKey).First(&p).Error
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
 		}
+		if err == nil && p.QaseProjectCode != "" {
+			return ErrJiraInitMapped
+		}
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			p = Project{ID: uuid.NewString(), JiraInitID: jiraID, Health: "unknown"}
+			p = Project{ID: uuid.NewString(), Health: "unknown"}
+		}
+		var qaseDuplicate int64
+		if err := tx.Model(&Project{}).Where("qase_project_code = ? AND qase_test_run_id = ? AND id <> ?", code, runID, p.ID).Count(&qaseDuplicate).Error; err != nil {
+			return err
+		}
+		if qaseDuplicate > 0 {
+			return ErrQaseRunMapped
 		}
 		p.JiraInitKey = jiraKey
 		p.Name = name
 		p.QaseProjectCode = code
-		p.Status = "pending_validation"
-		if err := tx.Save(&p).Error; err != nil {
-			return err
-		}
-		job := SyncJob{ID: uuid.NewString(), RequestKey: uuid.NewString(), Trigger: "project_validation", Status: "queued", ProjectID: p.ID, Sources: "jira,qase", RequestedAt: time.Now().UTC(), Actor: "manager"}
-		if err := tx.Create(&job).Error; err != nil {
-			return err
-		}
-		for _, source := range []string{"jira", "qase"} {
-			if err := tx.Create(&SyncStep{ID: uuid.NewString(), JobID: job.ID, Source: source, Status: "queued"}).Error; err != nil {
-				return err
-			}
-		}
-		return nil
+		p.QaseTestRunID = runID
+		p.QAOwner = qaOwner
+		p.StagingStartAt = &stagingStart
+		p.StagingEndAt = &stagingEnd
+		p.BetaStartAt = &betaStart
+		p.BetaEndAt = &betaEnd
+		return tx.Save(&p).Error
 	})
 	return p, err
 }
+
+const workflowQuery = `
+WITH project_scope AS (
+  SELECT p.id, p.qase_project_code, p.qase_test_run_id,
+         (SELECT count(*) FROM qase_run_cases rc WHERE rc.project_code=p.qase_project_code AND rc.run_id=p.qase_test_run_id) AS total
+  FROM projects p
+  WHERE p.qase_project_code <> '' AND p.qase_test_run_id > 0 AND (? = '' OR p.id = ?)
+), days AS (
+  SELECT DISTINCT date_trunc('day', r.ended_at) AS day, p.id AS project_id
+  FROM qase_results r
+  JOIN project_scope p ON p.qase_project_code=r.project_code AND p.qase_test_run_id=r.run_id
+  JOIN qase_run_cases rc ON rc.project_code=r.project_code AND rc.run_id=r.run_id AND rc.case_id=r.case_id
+  WHERE r.ended_at >= ? AND r.ended_at < ?
+)
+SELECT to_char(d.day, 'YYYY-MM-DD') AS date, p.id AS project_id,
+       count(latest.status) FILTER (WHERE latest.status='passed') AS passed,
+       count(latest.status) FILTER (WHERE latest.status='failed') AS failed,
+       count(latest.status) FILTER (WHERE latest.status='blocked') AS blocked,
+       p.total AS total
+FROM days d JOIN project_scope p ON p.id=d.project_id
+LEFT JOIN LATERAL (
+  SELECT DISTINCT ON (r.case_id) r.status
+  FROM qase_results r
+  JOIN qase_run_cases rc ON rc.project_code=r.project_code AND rc.run_id=r.run_id AND rc.case_id=r.case_id
+  WHERE r.project_code=p.qase_project_code AND r.run_id=p.qase_test_run_id AND r.ended_at < d.day + interval '1 day'
+  ORDER BY r.case_id, r.ended_at DESC NULLS LAST, r.result_id DESC
+) latest ON true
+WHERE p.total > 0
+GROUP BY d.day,p.id,p.total
+ORDER BY d.day,p.id`
+
 func (r *Monitoring) Workflow(from, to time.Time, projectID string) ([]WorkflowDay, error) {
-	var rows []WorkflowDay
-	latest := r.db.Table("qase_results r").Select("DISTINCT ON (r.project_code,r.run_id,r.case_id,r.configuration_key) r.project_code,r.run_id,r.case_id,r.configuration_key,r.status,r.ended_at").Joins("JOIN qase_run_cases rc ON rc.project_code=r.project_code AND rc.run_id=r.run_id AND rc.case_id=r.case_id").Order("r.project_code,r.run_id,r.case_id,r.configuration_key,r.ended_at DESC NULLS LAST,r.result_id DESC")
-	q := r.db.Table("(?) latest", latest).Select("to_char(latest.ended_at, 'YYYY-MM-DD') as date, p.id as project_id, count(*) filter (where latest.status='passed') as passed, count(*) filter (where latest.status='failed') as failed, count(*) filter (where latest.status='blocked') as blocked, count(*) as total").Joins("join projects p on p.qase_project_code=latest.project_code").Where("p.qase_project_code IN (SELECT qase_project_code FROM projects GROUP BY qase_project_code HAVING count(*)=1)").Where("latest.ended_at >= ? AND latest.ended_at < ?", from, to).Group("date,p.id").Order("date")
-	if projectID != "" {
-		q = q.Where("p.id = ?", projectID)
-	}
-	err := q.Scan(&rows).Error
+	rows := make([]WorkflowDay, 0)
+	err := r.db.Raw(workflowQuery, projectID, projectID, from, to).Scan(&rows).Error
 	return rows, err
 }
 func (r *Monitoring) Workload(from, to time.Time, memberID string) ([]WorkloadMember, error) {
@@ -459,7 +580,7 @@ func (r *Monitoring) Workload(from, to time.Time, memberID string) ([]WorkloadMe
 	}
 	out := make([]WorkloadMember, 0, len(members))
 	for _, m := range members {
-		v := WorkloadMember{ID: m.ID, Name: m.Name, DailyExecutions: []ExecutionDay{}}
+		v := WorkloadMember{ID: m.ID, Name: memberDisplayName(m), DailyExecutions: []ExecutionDay{}}
 		if err := r.db.Model(&Allocation{}).Select("coalesce(sum(planned_hours),0)").Where("member_id = ? AND week_start >= ? AND week_start < ?", m.ID, from, to).Scan(&v.PlannedHours).Error; err != nil {
 			return nil, err
 		}
@@ -473,6 +594,12 @@ func (r *Monitoring) Workload(from, to time.Time, memberID string) ([]WorkloadMe
 		out = append(out, v)
 	}
 	return out, nil
+}
+func memberDisplayName(member Member) string {
+	if name := strings.TrimSpace(member.Name); name != "" {
+		return name
+	}
+	return member.ID
 }
 func (r *Monitoring) Bugs(limit int, projectID, severity, status, search string) ([]JiraIssue, error) {
 	var v []JiraIssue

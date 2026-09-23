@@ -14,7 +14,10 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
-type API struct{ Repo *repository.Monitoring }
+type API struct {
+	Repo      *repository.Monitoring
+	Connector Connector
+}
 type sourceState struct {
 	Status   string     `json:"status"`
 	SyncedAt *time.Time `json:"syncedAt"`
@@ -26,8 +29,46 @@ type envelope struct {
 }
 type projectView struct {
 	Project
-	Counts          repository.Counts `json:"counts"`
-	CountsAvailable bool              `json:"countsAvailable"`
+	Counts          repository.Counts       `json:"counts"`
+	CountsAvailable bool                    `json:"countsAvailable"`
+	Runs            []repository.ProjectRun `json:"runs"`
+}
+type projectRegistration struct {
+	JiraInitKey     string `json:"jiraInitKey"`
+	Name            string `json:"name"`
+	QaseProjectCode string `json:"qaseProjectCode"`
+	QaseTestRunID   int64  `json:"qaseTestRunId"`
+	QAOwner         string `json:"qaOwner"`
+	StagingStartAt  string `json:"stagingStartAt"`
+	StagingEndAt    string `json:"stagingEndAt"`
+	BetaStartAt     string `json:"betaStartAt"`
+	BetaEndAt       string `json:"betaEndAt"`
+}
+type projectSchedule struct {
+	stagingStart, stagingEnd, betaStart, betaEnd time.Time
+}
+
+func (r *projectRegistration) validate() (projectSchedule, error) {
+	r.JiraInitKey = strings.ToUpper(strings.TrimSpace(r.JiraInitKey))
+	r.Name = strings.TrimSpace(r.Name)
+	r.QaseProjectCode = strings.ToUpper(strings.TrimSpace(r.QaseProjectCode))
+	r.QAOwner = strings.TrimSpace(r.QAOwner)
+	if !jiraKeyPattern.MatchString(r.JiraInitKey) || r.Name == "" || r.QaseProjectCode == "" || r.QaseTestRunID <= 0 || r.QAOwner == "" {
+		return projectSchedule{}, errors.New("missing required project field")
+	}
+	values := []string{r.StagingStartAt, r.StagingEndAt, r.BetaStartAt, r.BetaEndAt}
+	times := make([]time.Time, len(values))
+	for i, value := range values {
+		parsed, err := time.Parse(time.RFC3339, value)
+		if err != nil {
+			return projectSchedule{}, errors.New("project dates must use RFC3339")
+		}
+		times[i] = parsed.UTC()
+	}
+	if times[1].Before(times[0]) || times[3].Before(times[2]) {
+		return projectSchedule{}, errors.New("project end date precedes start date")
+	}
+	return projectSchedule{times[0], times[1], times[2], times[3]}, nil
 }
 
 func (a API) Register(e *echo.Echo) {
@@ -111,7 +152,11 @@ func (a API) projects(c echo.Context) error {
 		if err != nil {
 			return safeError(c, err)
 		}
-		result = append(result, projectView{Project: p, Counts: counts, CountsAvailable: available})
+		runs, err := a.Repo.ProjectRuns(p)
+		if err != nil {
+			return safeError(c, err)
+		}
+		result = append(result, projectView{Project: p, Counts: counts, CountsAvailable: available, Runs: runs})
 	}
 	return a.send(c, result)
 }
@@ -127,28 +172,34 @@ func (a API) project(c echo.Context) error {
 	if err != nil {
 		return safeError(c, err)
 	}
-	return a.send(c, projectView{Project: p, Counts: counts, CountsAvailable: available})
+	runs, err := a.Repo.ProjectRuns(p)
+	if err != nil {
+		return safeError(c, err)
+	}
+	return a.send(c, projectView{Project: p, Counts: counts, CountsAvailable: available, Runs: runs})
 }
 func (a API) createProject(c echo.Context) error {
-	var req struct {
-		JiraInitID      string `json:"jiraInitId"`
-		JiraInitKey     string `json:"jiraInitKey"`
-		Name            string `json:"name"`
-		QaseProjectCode string `json:"qaseProjectCode"`
-	}
+	var req projectRegistration
 	if err := c.Bind(&req); err != nil {
 		return invalidProject(c)
 	}
-	req.JiraInitID = strings.TrimSpace(req.JiraInitID)
-	req.JiraInitKey = strings.TrimSpace(req.JiraInitKey)
-	req.Name = strings.TrimSpace(req.Name)
-	req.QaseProjectCode = strings.ToUpper(strings.TrimSpace(req.QaseProjectCode))
-	if req.JiraInitID == "" || req.JiraInitKey == "" || req.Name == "" || req.QaseProjectCode == "" {
+	schedule, err := req.validate()
+	if err != nil {
 		return invalidProject(c)
 	}
-	p, err := a.Repo.SaveProjectMapping(req.JiraInitID, req.JiraInitKey, req.Name, req.QaseProjectCode)
-	if errors.Is(err, repository.ErrQaseProjectMapped) {
-		return c.JSON(http.StatusConflict, map[string]string{"code": "QASE_PROJECT_ALREADY_MAPPED", "message": "qaseProjectCode is already mapped"})
+	ctx := c.Request().Context()
+	if _, err := a.Connector.JiraIssue(ctx, req.JiraInitKey); err != nil {
+		return c.JSON(http.StatusUnprocessableEntity, map[string]string{"code": "JIRA_INIT_NOT_FOUND", "message": "jiraInitKey could not be validated against Jira"})
+	}
+	if _, err := a.Connector.QaseProject(ctx, req.QaseProjectCode); err != nil {
+		return c.JSON(http.StatusUnprocessableEntity, map[string]string{"code": "QASE_PROJECT_NOT_FOUND", "message": "qaseProjectCode could not be validated against Qase"})
+	}
+	p, err := a.Repo.SaveProjectMapping(req.JiraInitKey, req.Name, req.QaseProjectCode, req.QaseTestRunID, req.QAOwner, schedule.stagingStart, schedule.stagingEnd, schedule.betaStart, schedule.betaEnd)
+	if errors.Is(err, repository.ErrJiraInitMapped) {
+		return c.JSON(http.StatusConflict, map[string]string{"code": "JIRA_INIT_ALREADY_REGISTERED", "message": "jiraInitKey is already registered"})
+	}
+	if errors.Is(err, repository.ErrQaseRunMapped) {
+		return c.JSON(http.StatusConflict, map[string]string{"code": "QASE_RUN_ALREADY_REGISTERED", "message": "qaseProjectCode and qaseTestRunId are already registered"})
 	}
 	if err != nil {
 		return safeError(c, err)
@@ -156,7 +207,7 @@ func (a API) createProject(c echo.Context) error {
 	return c.JSON(http.StatusCreated, p)
 }
 func invalidProject(c echo.Context) error {
-	return c.JSON(http.StatusBadRequest, map[string]string{"code": "INVALID_PROJECT", "message": "jiraInitId, jiraInitKey, name and qaseProjectCode are required"})
+	return c.JSON(http.StatusBadRequest, map[string]string{"code": "INVALID_PROJECT", "message": "jiraInitKey, name, qaseProjectCode, qaseTestRunId, qaOwner and valid staging/beta ranges are required"})
 }
 func dateRange(c echo.Context) (time.Time, time.Time, error) {
 	now := time.Now().UTC()
