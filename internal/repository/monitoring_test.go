@@ -77,7 +77,7 @@ func TestNormalizeQaseEnvironment(t *testing.T) {
 	}
 }
 
-func TestMemberActiveDefaultsTrueAndFiltersWork(t *testing.T) {
+func TestMemberActiveFilterRoundTrips(t *testing.T) {
 	repo := NewSQLiteForTest(t)
 	if err := repo.SaveMember(&Member{ID: "m1", Name: "Nadia Putri", WeeklyCapacityHours: 40, Active: true}); err != nil {
 		t.Fatalf("save active member: %v", err)
@@ -103,8 +103,22 @@ func TestMemberActiveDefaultsTrueAndFiltersWork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get member: %v", err)
 	}
-	if got.Name != "Old Member" {
+	if got.Name != "Old Member" || got.Active {
 		t.Fatalf("unexpected member: %+v", got)
+	}
+
+	// Guards the exact bug the Active field's gorm tag was chosen to avoid:
+	// there is no DB-level default, so an unset Active must persist as false,
+	// not silently flip to true.
+	if err := repo.SaveMember(&Member{ID: "m3", Name: "No Explicit Active"}); err != nil {
+		t.Fatalf("save member with unset active: %v", err)
+	}
+	m3, err := repo.Member("m3")
+	if err != nil {
+		t.Fatalf("get member: %v", err)
+	}
+	if m3.Active {
+		t.Fatalf("expected Active to persist as false when left unset, got %+v", m3)
 	}
 }
 
