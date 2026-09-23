@@ -16,6 +16,11 @@ func NewSQLiteForTest(t *testing.T) *Monitoring {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("get sql.DB: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
 	if err := db.AutoMigrate(Models()...); err != nil {
 		t.Fatalf("automigrate: %v", err)
 	}

@@ -503,6 +503,7 @@ func normalizeQaseEnvironment(value string) string {
 func (r *Monitoring) SaveProjectMapping(jiraKey, name, code string, runID int64, qaOwner string, stagingStart, stagingEnd, betaStart, betaEnd time.Time) (Project, error) {
 	var p Project
 	err := r.db.Transaction(func(tx *gorm.DB) error {
+		// ponytail: check-then-insert race on duplicate jiraInitKey/qaseProjectCode+runID is possible under concurrent requests; acceptable given this is a manager-only, low-volume endpoint — add a DB-level advisory lock if concurrent creates become a real issue
 		err := tx.Where("jira_init_key = ?", jiraKey).First(&p).Error
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err

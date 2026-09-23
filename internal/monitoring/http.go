@@ -189,9 +189,15 @@ func (a API) createProject(c echo.Context) error {
 	}
 	ctx := c.Request().Context()
 	if _, err := a.Connector.JiraIssue(ctx, req.JiraInitKey); err != nil {
+		if err.Error() == "JIRA_CONFIG_MISSING" {
+			return c.JSON(http.StatusServiceUnavailable, map[string]string{"code": "JIRA_CONFIG_MISSING", "message": "Jira integration is not configured"})
+		}
 		return c.JSON(http.StatusUnprocessableEntity, map[string]string{"code": "JIRA_INIT_NOT_FOUND", "message": "jiraInitKey could not be validated against Jira"})
 	}
 	if _, err := a.Connector.QaseProject(ctx, req.QaseProjectCode); err != nil {
+		if err.Error() == "QASE_CONFIG_MISSING" {
+			return c.JSON(http.StatusServiceUnavailable, map[string]string{"code": "QASE_CONFIG_MISSING", "message": "Qase integration is not configured"})
+		}
 		return c.JSON(http.StatusUnprocessableEntity, map[string]string{"code": "QASE_PROJECT_NOT_FOUND", "message": "qaseProjectCode could not be validated against Qase"})
 	}
 	p, err := a.Repo.SaveProjectMapping(req.JiraInitKey, req.Name, req.QaseProjectCode, req.QaseTestRunID, req.QAOwner, schedule.stagingStart, schedule.stagingEnd, schedule.betaStart, schedule.betaEnd)

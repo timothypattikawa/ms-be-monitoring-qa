@@ -129,3 +129,19 @@ func TestCreateProjectRejectsUnknownJiraKey(t *testing.T) {
 		t.Fatalf("expected 422, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestCreateProjectReturns503WhenJiraNotConfigured(t *testing.T) {
+	repo := repository.NewSQLiteForTest(t)
+	api := API{Repo: repo, Connector: Connector{}} // no JiraBaseURL/Email/Token set
+	e := echo.New()
+	body := `{"jiraInitKey":"INIT-3001","name":"Checkout","qaseProjectCode":"PAY","qaseTestRunId":181,"qaOwner":"Nadia","stagingStartAt":"2026-09-01T00:00:00Z","stagingEndAt":"2026-09-10T00:00:00Z","betaStartAt":"2026-09-11T00:00:00Z","betaEndAt":"2026-09-20T00:00:00Z"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	if err := api.createProject(e.NewContext(req, rec)); err != nil {
+		t.Fatalf("unexpected handler error: %v", err)
+	}
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
