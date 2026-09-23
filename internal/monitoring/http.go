@@ -71,11 +71,36 @@ func (r *projectRegistration) validate() (projectSchedule, error) {
 	return projectSchedule{times[0], times[1], times[2], times[3]}, nil
 }
 
+type memberRegistration struct {
+	Name                string  `json:"name"`
+	JiraAccountID       string  `json:"jiraAccountId"`
+	QaseMemberID        string  `json:"qaseMemberId"`
+	WeeklyCapacityHours float64 `json:"weeklyCapacityHours"`
+}
+
+func (r *memberRegistration) validate() error {
+	r.Name = strings.TrimSpace(r.Name)
+	r.JiraAccountID = strings.TrimSpace(r.JiraAccountID)
+	r.QaseMemberID = strings.TrimSpace(r.QaseMemberID)
+	if r.Name == "" || r.WeeklyCapacityHours < 0 {
+		return errors.New("missing required member field")
+	}
+	return nil
+}
+
+func invalidMember(c echo.Context) error {
+	return c.JSON(http.StatusBadRequest, map[string]string{"code": "INVALID_MEMBER", "message": "name is required and weeklyCapacityHours must not be negative"})
+}
+
 func (a API) Register(e *echo.Echo) {
 	g := e.Group("/api/v1")
 	g.GET("/projects", a.projects)
 	g.GET("/projects/:id", a.project)
 	g.POST("/projects", a.createProject, a.managerAuth)
+	g.GET("/qa-members", a.members)
+	g.GET("/qa-members/:id", a.member)
+	g.POST("/qa-members", a.createMember, a.managerAuth)
+	g.PATCH("/qa-members/:id", a.updateMember, a.managerAuth)
 	g.GET("/workflow", a.workflow)
 	g.GET("/workload", a.workload)
 	g.GET("/bugs", a.bugs)
@@ -212,6 +237,82 @@ func (a API) createProject(c echo.Context) error {
 	}
 	return c.JSON(http.StatusCreated, p)
 }
+func (a API) members(c echo.Context) error {
+	rows, err := a.Repo.Members(c.QueryParam("includeInactive") == "true")
+	if err != nil {
+		return safeError(c, err)
+	}
+	return a.send(c, rows)
+}
+
+func (a API) member(c echo.Context) error {
+	v, err := a.Repo.Member(c.Param("id"))
+	if errors.Is(err, repository.ErrNotFound) {
+		return c.JSON(http.StatusNotFound, map[string]string{"code": "NOT_FOUND", "message": "qa member not found"})
+	}
+	if err != nil {
+		return safeError(c, err)
+	}
+	return a.send(c, v)
+}
+
+func (a API) createMember(c echo.Context) error {
+	var req memberRegistration
+	if err := c.Bind(&req); err != nil {
+		return invalidMember(c)
+	}
+	if err := req.validate(); err != nil {
+		return invalidMember(c)
+	}
+	v := Member{ID: uuid.NewString(), Name: req.Name, JiraAccountID: req.JiraAccountID, QaseMemberID: req.QaseMemberID, WeeklyCapacityHours: req.WeeklyCapacityHours, Active: true}
+	if err := a.Repo.SaveMember(&v); err != nil {
+		return safeError(c, err)
+	}
+	return c.JSON(http.StatusCreated, v)
+}
+
+func (a API) updateMember(c echo.Context) error {
+	v, err := a.Repo.Member(c.Param("id"))
+	if errors.Is(err, repository.ErrNotFound) {
+		return c.JSON(http.StatusNotFound, map[string]string{"code": "NOT_FOUND", "message": "qa member not found"})
+	}
+	if err != nil {
+		return safeError(c, err)
+	}
+	var req struct {
+		Name                *string  `json:"name"`
+		JiraAccountID       *string  `json:"jiraAccountId"`
+		QaseMemberID        *string  `json:"qaseMemberId"`
+		WeeklyCapacityHours *float64 `json:"weeklyCapacityHours"`
+		Active              *bool    `json:"active"`
+	}
+	if err := c.Bind(&req); err != nil {
+		return invalidMember(c)
+	}
+	if req.Name != nil {
+		v.Name = strings.TrimSpace(*req.Name)
+	}
+	if req.JiraAccountID != nil {
+		v.JiraAccountID = strings.TrimSpace(*req.JiraAccountID)
+	}
+	if req.QaseMemberID != nil {
+		v.QaseMemberID = strings.TrimSpace(*req.QaseMemberID)
+	}
+	if req.WeeklyCapacityHours != nil {
+		v.WeeklyCapacityHours = *req.WeeklyCapacityHours
+	}
+	if req.Active != nil {
+		v.Active = *req.Active
+	}
+	if v.Name == "" || v.WeeklyCapacityHours < 0 {
+		return invalidMember(c)
+	}
+	if err := a.Repo.SaveMember(&v); err != nil {
+		return safeError(c, err)
+	}
+	return c.JSON(http.StatusOK, v)
+}
+
 func invalidProject(c echo.Context) error {
 	return c.JSON(http.StatusBadRequest, map[string]string{"code": "INVALID_PROJECT", "message": "jiraInitKey, name, qaseProjectCode, qaseTestRunId, qaOwner and valid staging/beta ranges are required"})
 }

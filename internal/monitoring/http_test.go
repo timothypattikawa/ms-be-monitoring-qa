@@ -145,3 +145,69 @@ func TestCreateProjectReturns503WhenJiraNotConfigured(t *testing.T) {
 		t.Fatalf("expected 503, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestCreateAndUpdateQaMember(t *testing.T) {
+	repo := repository.NewSQLiteForTest(t)
+	api := API{Repo: repo}
+	e := echo.New()
+
+	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/qa-members", strings.NewReader(`{"name":"Nadia Putri","jiraAccountId":"acc-1","qaseMemberId":"qm-1","weeklyCapacityHours":40}`))
+	createReq.Header.Set("Content-Type", "application/json")
+	createRec := httptest.NewRecorder()
+	if err := api.createMember(e.NewContext(createReq, createRec)); err != nil {
+		t.Fatalf("unexpected handler error: %v", err)
+	}
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+	var created repository.Member
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created member: %v", err)
+	}
+	if created.ID == "" || !created.Active {
+		t.Fatalf("expected an active member with an id, got %+v", created)
+	}
+
+	updateReq := httptest.NewRequest(http.MethodPatch, "/api/v1/qa-members/"+created.ID, strings.NewReader(`{"active":false}`))
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateRec := httptest.NewRecorder()
+	ctx := e.NewContext(updateReq, updateRec)
+	ctx.SetParamNames("id")
+	ctx.SetParamValues(created.ID)
+	if err := api.updateMember(ctx); err != nil {
+		t.Fatalf("unexpected handler error: %v", err)
+	}
+	if updateRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", updateRec.Code, updateRec.Body.String())
+	}
+	var updated repository.Member
+	if err := json.Unmarshal(updateRec.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("decode updated member: %v", err)
+	}
+	if updated.Active {
+		t.Fatalf("expected member to be deactivated, got %+v", updated)
+	}
+
+	listed, err := repo.Members(false)
+	if err != nil {
+		t.Fatalf("list active members: %v", err)
+	}
+	if len(listed) != 0 {
+		t.Fatalf("expected deactivated member to be excluded from active list, got %+v", listed)
+	}
+}
+
+func TestCreateQaMemberRejectsMissingName(t *testing.T) {
+	repo := repository.NewSQLiteForTest(t)
+	api := API{Repo: repo}
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/qa-members", strings.NewReader(`{"weeklyCapacityHours":40}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	if err := api.createMember(e.NewContext(req, rec)); err != nil {
+		t.Fatalf("unexpected handler error: %v", err)
+	}
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
