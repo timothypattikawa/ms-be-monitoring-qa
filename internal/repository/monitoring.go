@@ -37,6 +37,12 @@ type Member struct {
 	JiraAccountID       string  `gorm:"index" json:"jiraAccountId"`
 	QaseMemberID        string  `gorm:"index" json:"qaseMemberId"`
 	WeeklyCapacityHours float64 `json:"weeklyCapacityHours"`
+	// ponytail: no gorm "default:true" tag — gorm treats a zero-value bool
+	// (false) with a default tag as "unset" and silently overwrites it with
+	// the schema default on insert, so an explicit Active:false would never
+	// persist. Callers (e.g. the qa-members create handler) must set
+	// Active:true explicitly for new members instead of relying on a DB default.
+	Active bool `gorm:"not null" json:"active"`
 }
 type Allocation struct {
 	ID           string    `gorm:"primaryKey"`
@@ -404,6 +410,23 @@ func (r *Monitoring) Project(id string) (Project, error) {
 	err := r.db.First(&v, "id = ?", id).Error
 	return v, err
 }
+func (r *Monitoring) Members(includeInactive bool) ([]Member, error) {
+	var v []Member
+	q := r.db.Order("name asc")
+	if !includeInactive {
+		q = q.Where("active = ?", true)
+	}
+	err := q.Find(&v).Error
+	return v, err
+}
+
+func (r *Monitoring) Member(id string) (Member, error) {
+	var v Member
+	err := r.db.First(&v, "id = ?", id).Error
+	return v, err
+}
+
+func (r *Monitoring) SaveMember(v *Member) error { return r.db.Save(v).Error }
 func (r *Monitoring) ProjectCounts(p Project) (Counts, bool, error) {
 	var out Counts
 	if p.QaseProjectCode == "" {
