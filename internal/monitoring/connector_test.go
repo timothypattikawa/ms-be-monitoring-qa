@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -42,15 +43,19 @@ func TestQaseRunCaseParsingRejectsMissingOrMalformedMembership(t *testing.T) {
 	}
 }
 
-func TestQasePagesRejectsIncompletePage(t *testing.T) {
+func TestQasePagesToleratesTotalMismatch(t *testing.T) {
+	visited := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": true, "result": map[string]any{"total": 500, "entities": []any{map[string]int{"id": 1}}}})
 	}))
 	defer srv.Close()
 	x := Connector{Client: srv.Client(), QaseBaseURL: srv.URL, QaseToken: "secret"}
-	err := x.QasePages(context.Background(), "run", "INIT", func(json.RawMessage) error { return nil })
-	if err == nil || err.Error() != "QASE_PAGE_INCOMPLETE" {
-		t.Fatalf("expected incomplete page error, got %v", err)
+	err := x.QasePages(context.Background(), "run", "INIT", func(json.RawMessage) error { visited++; return nil })
+	if err != nil {
+		t.Fatalf("expected the persistently short page to be accepted as final, got %v", err)
+	}
+	if visited != 1 {
+		t.Fatalf("expected the single returned entity to still be visited, got %d", visited)
 	}
 }
 
@@ -145,6 +150,14 @@ func TestJiraNextPageToken(t *testing.T) {
 		if req["jql"] != "project = INIT" {
 			t.Error("wrong JQL")
 		}
+		fields, _ := req["fields"].([]any)
+		hasPriority := false
+		for _, field := range fields {
+			hasPriority = hasPriority || field == "priority"
+		}
+		if !hasPriority {
+			t.Errorf("Jira search fields must include priority: %v", fields)
+		}
 		if requests == 1 {
 			_ = json.NewEncoder(w).Encode(map[string]any{"issues": []any{map[string]any{"id": "1", "key": "INIT-1"}}, "nextPageToken": "next", "isLast": false})
 			return
@@ -172,7 +185,14 @@ func TestJiraNextPageToken(t *testing.T) {
 }
 
 func TestRunPlatformKeepsEnvironmentSeparate(t *testing.T) {
-	for title, want := range map[string]string{"[STG] AOS": "AOS", "[STG] IOS": "IOS", "[STG] BO": "BO", "[STG] DB": "DB", "[STG] APO": "APO", "Regression": "unknown"} {
+	for title, want := range map[string]string{
+		"[STG] AOS": "AOS", "[STG] IOS": "IOS", "[STG] BO": "BO", "[STG] DB": "DB", "[STG] APO": "APO",
+		"Regression": "unknown",
+		// real ILTA run titles: human names, and a [BETA] tag the old
+		// literal-"[STG] "-prefix check never recognized at all.
+		"[BETA] APO Main": "APO", "[BETA] APO Mitra": "APO", "[BETA] Android": "AOS", "[BETA] IOS": "IOS",
+		"[STG] Android": "AOS", "[STG] Webcom": "unknown",
+	} {
 		if got := runPlatform(title); got != want {
 			t.Errorf("%s: got %s, want %s", title, got, want)
 		}
@@ -232,6 +252,242 @@ func TestQaseProjectFound(t *testing.T) {
 	}
 	if len(result) == 0 {
 		t.Fatal("expected a non-empty result payload")
+	}
+}
+
+func TestQaseCustomFieldsResolvesOptions(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/custom_field" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if r.Header.Get("Token") != "secret" {
+			t.Errorf("missing Qase token")
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": true, "result": map[string]any{"total": 1, "entities": []any{
+			map[string]any{"id": 7, "title": "QA PIC", "type": "Multiselect", "entity": "case", "value": []any{map[string]any{"id": 6, "title": "Melisa"}}},
+		}}})
+	}))
+	defer srv.Close()
+	x := Connector{Client: srv.Client(), QaseBaseURL: srv.URL, QaseToken: "secret"}
+	fields, err := x.QaseCustomFields(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(fields) != 1 || fields[0].ID != 7 || fields[0].Title != "QA PIC" || len(fields[0].Value) != 1 || fields[0].Value[0].Title != "Melisa" {
+		t.Fatalf("unexpected fields: %+v", fields)
+	}
+}
+
+func TestQaseCustomFieldsConfigMissing(t *testing.T) {
+	x := Connector{}
+	if _, err := x.QaseCustomFields(context.Background()); err == nil || err.Error() != "QASE_CONFIG_MISSING" {
+		t.Fatalf("expected QASE_CONFIG_MISSING, got %v", err)
+	}
+}
+
+func TestJiraUserByEmailFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/rest/api/3/user/search" || r.URL.Query().Get("query") != "kiki.manurung@gli.id" {
+			t.Fatalf("unexpected request: %s", r.URL.String())
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"accountId": "60e3cc8fc0db53006aa59eaf", "emailAddress": "kiki.manurung@gli.id"}})
+	}))
+	defer srv.Close()
+	x := Connector{Client: srv.Client(), JiraBaseURL: srv.URL, JiraEmail: "qa@example.com", JiraToken: "token"}
+	id, err := x.JiraUserByEmail(context.Background(), "kiki.manurung@gli.id")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id != "60e3cc8fc0db53006aa59eaf" {
+		t.Fatalf("got %q, want accountId", id)
+	}
+}
+
+func TestJiraUserByEmailNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	}))
+	defer srv.Close()
+	x := Connector{Client: srv.Client(), JiraBaseURL: srv.URL, JiraEmail: "qa@example.com", JiraToken: "token"}
+	if _, err := x.JiraUserByEmail(context.Background(), "nobody@example.com"); err == nil || err.Error() != "JIRA_USER_NOT_FOUND" {
+		t.Fatalf("expected JIRA_USER_NOT_FOUND, got %v", err)
+	}
+}
+
+func TestQaseRunIDsIncludesFinishedRuns(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/run/ILTA" || r.URL.Query().Get("status") != "" {
+			t.Fatalf("unexpected request: %s", r.URL.String())
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": true, "result": map[string]any{"total": 9, "entities": []any{
+			map[string]any{"id": 1, "title": "[STG] IOS", "status": 3},
+			map[string]any{"id": 2, "title": "[STG] Android", "status": 3},
+			map[string]any{"id": 3, "title": "[STG] APO Mitra", "status": 1},
+			map[string]any{"id": 4, "title": "[STG] APO Main", "status": 1},
+			map[string]any{"id": 5, "title": "[STG] Webcom", "status": 1},
+			map[string]any{"id": 8, "title": "[BETA] APO Main", "status": 0},
+			map[string]any{"id": 9, "title": "[BETA] APO Mitra", "status": 0},
+			map[string]any{"id": 10, "title": "[BETA] Android", "status": 0},
+			map[string]any{"id": 11, "title": "[BETA] IOS", "status": 0},
+		}}})
+	}))
+	defer srv.Close()
+	x := Connector{Client: srv.Client(), QaseBaseURL: srv.URL, QaseToken: "secret"}
+	ids, err := x.QaseRunIDs(context.Background(), "ILTA")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []int64{1, 2, 3, 4, 5, 8, 9, 10, 11}
+	if len(ids) != len(want) {
+		t.Fatalf("got %v, want %v", ids, want)
+	}
+	for i := range want {
+		if ids[i] != want[i] {
+			t.Fatalf("got %v, want %v", ids, want)
+		}
+	}
+}
+
+func TestQaseRunIDsConfigMissing(t *testing.T) {
+	x := Connector{}
+	if _, err := x.QaseRunIDs(context.Background(), "ILTA"); err == nil || err.Error() != "QASE_CONFIG_MISSING" {
+		t.Fatalf("expected QASE_CONFIG_MISSING, got %v", err)
+	}
+}
+
+func TestQaseDefectsLoadsEveryPage(t *testing.T) {
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path != "/v1/defect/PAY" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+		n := 100
+		if offset == 100 {
+			n = 1
+		}
+		entities := make([]map[string]any, n)
+		for i := range entities {
+			id := offset + i + 1
+			entities[i] = map[string]any{"id": id, "title": fmt.Sprintf("Bug %d", id), "status": "open", "severity": "major", "external_data": `{"jira-cloud":{"key":"QASE-1"}}`, "results": []string{"result-1"}}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": true, "result": map[string]any{"total": 101, "entities": entities}})
+	}))
+	defer srv.Close()
+	x := Connector{Client: srv.Client(), QaseBaseURL: srv.URL, QaseToken: "secret"}
+	defects, err := x.QaseDefects(context.Background(), "PAY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defects) != 101 || requests != 2 {
+		t.Fatalf("got %d defects in %d requests", len(defects), requests)
+	}
+	if defects[0].Title != "Bug 1" || defects[0].Status != "open" {
+		t.Fatalf("unexpected defect: %+v", defects[0])
+	}
+	if len(defects[0].Results) != 1 || defects[0].Results[0] != "result-1" {
+		t.Fatalf("expected defect result relation, got %+v", defects[0].Results)
+	}
+}
+
+func TestQaseDefectsConfigMissing(t *testing.T) {
+	x := Connector{}
+	if _, err := x.QaseDefects(context.Background(), "PAY"); err == nil || err.Error() != "QASE_CONFIG_MISSING" {
+		t.Fatalf("expected QASE_CONFIG_MISSING, got %v", err)
+	}
+}
+
+func TestJiraIssueIncludesEnrichmentFields(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("fields") != "summary,status,issuetype,assignee,reporter,creator,priority,created,customfield_10185" {
+			t.Fatalf("unexpected fields param: %s", r.URL.Query().Get("fields"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"10042","key":"QASE-19216","fields":{"summary":"Checkout bug","status":{"name":"Open"},"issuetype":{"name":"Bug"},"assignee":{"accountId":"a1","displayName":"Nadia"},"reporter":{"accountId":"r1","displayName":"Kiki"},"creator":{"accountId":"c1","displayName":"Dea"},"priority":{"name":"Medium"},"created":"2024-01-15T10:30:00.000+0700"}}`))
+	}))
+	defer srv.Close()
+	x := Connector{Client: srv.Client(), JiraBaseURL: srv.URL, JiraEmail: "qa@example.com", JiraToken: "token"}
+	issue, err := x.JiraIssue(context.Background(), "QASE-19216")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if issue.Fields.Assignee.DisplayName != "Nadia" || issue.Fields.Reporter.DisplayName != "Kiki" || issue.Fields.Creator.DisplayName != "Dea" || issue.Fields.Priority.Name != "Medium" || issue.Fields.Created != "2024-01-15T10:30:00.000+0700" {
+		t.Fatalf("unexpected enrichment fields: %+v", issue.Fields)
+	}
+}
+
+func TestJiraActiveInitsWithQAs(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		fieldID    string
+		wantCalled bool
+		wantIssues []jiraIssueWithQAs
+	}{
+		{
+			name:       "unset field id no-ops without calling Jira",
+			fieldID:    "",
+			wantCalled: false,
+		},
+		{
+			name:       "parses key and QAs array from configured field",
+			fieldID:    "customfield_10099",
+			wantCalled: true,
+			wantIssues: []jiraIssueWithQAs{
+				{Key: "INIT-1", QAs: []jiraQAUser{{AccountID: "acc1", DisplayName: "Nadia"}, {AccountID: "acc2", DisplayName: "Kiki"}}},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("JIRA_QAS_FIELD_ID", tc.fieldID)
+			called := false
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				called = true
+				if r.Method != http.MethodPost || r.URL.Path != "/rest/api/3/search/jql" {
+					t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+				}
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var request struct {
+					JQL string `json:"jql"`
+				}
+				if err := json.Unmarshal(body, &request); err != nil {
+					t.Fatal(err)
+				}
+				if request.JQL != qaPortfolioJQL {
+					t.Fatalf("JQL = %q, want %q", request.JQL, qaPortfolioJQL)
+				}
+				_, _ = w.Write([]byte(`{"issues":[{"key":"INIT-1","fields":{"customfield_10099":[{"accountId":"acc1","displayName":"Nadia"},{"accountId":"acc2","displayName":"Kiki"}]}}],"isLast":true}`))
+			}))
+			defer srv.Close()
+			x := Connector{Client: srv.Client(), JiraBaseURL: srv.URL, JiraEmail: "qa@example.com", JiraToken: "token"}
+			var got []jiraIssueWithQAs
+			err := x.JiraActiveInitsWithQAs(context.Background(), func(issue jiraIssueWithQAs) error {
+				got = append(got, issue)
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if called != tc.wantCalled {
+				t.Fatalf("called = %v, want %v", called, tc.wantCalled)
+			}
+			if len(got) != len(tc.wantIssues) {
+				t.Fatalf("got %+v, want %+v", got, tc.wantIssues)
+			}
+			for i := range got {
+				if got[i].Key != tc.wantIssues[i].Key || len(got[i].QAs) != len(tc.wantIssues[i].QAs) {
+					t.Fatalf("got %+v, want %+v", got[i], tc.wantIssues[i])
+				}
+				for j := range got[i].QAs {
+					if got[i].QAs[j] != tc.wantIssues[i].QAs[j] {
+						t.Fatalf("got %+v, want %+v", got[i].QAs[j], tc.wantIssues[i].QAs[j])
+					}
+				}
+			}
+		})
 	}
 }
 

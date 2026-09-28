@@ -17,12 +17,12 @@ import (
 )
 
 type Connector struct {
-	Client                                                                         *http.Client
-	JiraBaseURL, JiraEmail, JiraToken, JiraJQL, JiraBugJQL, QaseBaseURL, QaseToken string
+	Client                                                    *http.Client
+	JiraBaseURL, JiraEmail, JiraToken, QaseBaseURL, QaseToken string
 }
 
 func NewConnector() Connector {
-	return Connector{Client: &http.Client{Timeout: 30 * time.Second}, JiraBaseURL: strings.TrimRight(os.Getenv("JIRA_BASE_URL"), "/"), JiraEmail: os.Getenv("JIRA_EMAIL"), JiraToken: os.Getenv("JIRA_API_TOKEN"), JiraJQL: os.Getenv("JIRA_ACTIVE_JQL"), JiraBugJQL: os.Getenv("JIRA_BUG_JQL"), QaseBaseURL: strings.TrimRight(defaultString(os.Getenv("QASE_BASE_URL"), "https://api.qase.io"), "/"), QaseToken: os.Getenv("QASE_API_TOKEN")}
+	return Connector{Client: &http.Client{Timeout: 30 * time.Second}, JiraBaseURL: strings.TrimRight(os.Getenv("JIRA_BASE_URL"), "/"), JiraEmail: os.Getenv("JIRA_EMAIL"), JiraToken: os.Getenv("JIRA_API_TOKEN"), QaseBaseURL: strings.TrimRight(defaultString(os.Getenv("QASE_BASE_URL"), "https://api.qase.io"), "/"), QaseToken: os.Getenv("QASE_API_TOKEN")}
 }
 func defaultString(v, def string) string {
 	if v == "" {
@@ -43,15 +43,31 @@ type jiraIssue struct {
 			Name string `json:"name"`
 		} `json:"issuetype"`
 		Creator struct {
-			AccountID string `json:"accountId"`
+			AccountID   string `json:"accountId"`
+			DisplayName string `json:"displayName"`
 		} `json:"creator"`
 		Reporter struct {
-			AccountID string `json:"accountId"`
+			AccountID   string `json:"accountId"`
+			DisplayName string `json:"displayName"`
 		} `json:"reporter"`
 		Assignee struct {
-			AccountID string `json:"accountId"`
+			AccountID   string `json:"accountId"`
+			DisplayName string `json:"displayName"`
 		} `json:"assignee"`
+		Priority struct {
+			Name string `json:"name"`
+		} `json:"priority"`
+		// TestingEnvironment is Jira's own "Testing Environment" dropdown
+		// (customfield_10185, confirmed via /rest/api/3/field) — the same
+		// field product's JQL filters on ("testing environment[dropdown]").
+		// Authoritative source for a defect's environment; the Qase
+		// run/result-linkage heuristic only covers defects Qase itself
+		// managed to link to a run.
+		TestingEnvironment struct {
+			Value string `json:"value"`
+		} `json:"customfield_10185"`
 		Updated    string `json:"updated"`
+		Created    string `json:"created"`
 		IssueLinks []struct {
 			InwardIssue *struct {
 				ID string `json:"id"`
@@ -75,7 +91,7 @@ func (x Connector) JiraPages(ctx context.Context, jql string, visit func(jiraIss
 	pageToken := ""
 	seen := map[string]bool{}
 	for page := 0; page < 10000; page++ {
-		body := map[string]any{"jql": jql, "fields": []string{"summary", "status", "issuetype", "updated", "creator", "reporter", "assignee", "issuelinks"}, "maxResults": 100}
+		body := map[string]any{"jql": jql, "fields": []string{"summary", "status", "issuetype", "updated", "created", "creator", "reporter", "assignee", "priority", "issuelinks", "customfield_10019", "customfield_10185"}, "maxResults": 100}
 		if pageToken != "" {
 			body["nextPageToken"] = pageToken
 		}
@@ -114,11 +130,92 @@ func (x Connector) JiraPages(ctx context.Context, jql string, visit func(jiraIss
 	return errors.New("JIRA_PAGE_LIMIT")
 }
 
+// qaPortfolioJQL is plan §10.1's exact JQL for the QA-assigned active
+// project portfolio. The QAs field's JSON key isn't known statically (it's
+// workspace-specific), so it's injected via JIRA_QAS_FIELD_ID.
+const qaPortfolioJQL = `project = INIT AND status NOT IN (Cancel, Done, Postponed, Backlog) AND "QAs[User Picker (multiple users)]" IS NOT EMPTY ORDER BY created DESC`
+
+type jiraQAUser struct {
+	AccountID   string `json:"accountId"`
+	DisplayName string `json:"displayName"`
+}
+
+type jiraIssueWithQAs struct {
+	Key string
+	QAs []jiraQAUser
+}
+
+// JiraActiveInitsWithQAs lists active INIT issues that have a QA assigned,
+// via plan §10.1's JQL, and hands back each issue's key plus its QAs custom
+// field. ponytail: the real QAs field ID isn't known yet, so this reads it
+// from JIRA_QAS_FIELD_ID at call time and no-ops cleanly until ops set it —
+// activates once JIRA_QAS_FIELD_ID is configured.
+func (x Connector) JiraActiveInitsWithQAs(ctx context.Context, visit func(jiraIssueWithQAs) error) error {
+	fieldID := os.Getenv("JIRA_QAS_FIELD_ID")
+	if fieldID == "" {
+		return nil
+	}
+	if x.JiraBaseURL == "" || x.JiraEmail == "" || x.JiraToken == "" {
+		return errors.New("JIRA_CONFIG_MISSING")
+	}
+	pageToken := ""
+	seen := map[string]bool{}
+	for page := 0; page < 10000; page++ {
+		body := map[string]any{"jql": qaPortfolioJQL, "fields": []string{"summary", fieldID}, "maxResults": 100}
+		if pageToken != "" {
+			body["nextPageToken"] = pageToken
+		}
+		payload, _ := json.Marshal(body)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, x.JiraBaseURL+"/rest/api/3/search/jql", strings.NewReader(string(payload)))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(x.JiraEmail+":"+x.JiraToken)))
+		var raw struct {
+			Issues []struct {
+				Key    string                     `json:"key"`
+				Fields map[string]json.RawMessage `json:"fields"`
+			} `json:"issues"`
+			NextPageToken string `json:"nextPageToken"`
+			IsLast        bool   `json:"isLast"`
+		}
+		if err := x.do(req, &raw); err != nil {
+			return err
+		}
+		for _, issue := range raw.Issues {
+			if issue.Key == "" {
+				return errors.New("JIRA_ID_MISSING")
+			}
+			var qas []jiraQAUser
+			if b := issue.Fields[fieldID]; len(b) > 0 {
+				_ = json.Unmarshal(b, &qas)
+			}
+			if err := visit(jiraIssueWithQAs{Key: issue.Key, QAs: qas}); err != nil {
+				return err
+			}
+		}
+		if raw.IsLast {
+			return nil
+		}
+		if raw.NextPageToken == "" {
+			return errors.New("JIRA_CURSOR_MISSING")
+		}
+		if seen[raw.NextPageToken] {
+			return errors.New("JIRA_CURSOR_LOOP")
+		}
+		seen[raw.NextPageToken] = true
+		pageToken = raw.NextPageToken
+	}
+	return errors.New("JIRA_PAGE_LIMIT")
+}
+
 func (x Connector) JiraIssue(ctx context.Context, key string) (jiraIssue, error) {
 	if x.JiraBaseURL == "" || x.JiraEmail == "" || x.JiraToken == "" || key == "" {
 		return jiraIssue{}, errors.New("JIRA_CONFIG_MISSING")
 	}
-	endpoint := fmt.Sprintf("%s/rest/api/3/issue/%s?fields=summary,status,issuetype", x.JiraBaseURL, url.PathEscape(key))
+	endpoint := fmt.Sprintf("%s/rest/api/3/issue/%s?fields=summary,status,issuetype,assignee,reporter,creator,priority,created,customfield_10185", x.JiraBaseURL, url.PathEscape(key))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return jiraIssue{}, err
@@ -181,30 +278,41 @@ func (x Connector) QasePagesForRun(ctx context.Context, resource, projectCode st
 		if resource == "result" && runID > 0 {
 			endpoint += "&run=" + strconv.FormatInt(runID, 10)
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Token", x.QaseToken)
-		var env qaseEnvelope
-		if err := x.do(req, &env); err != nil {
-			return err
-		}
-		if !env.Status {
-			return errors.New("QASE_REJECTED")
-		}
 		var list qaseList
-		if err := json.Unmarshal(env.Result, &list); err != nil {
-			return errors.New("QASE_RESPONSE_INVALID")
+		for attempt := 0; ; attempt++ {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+			if err != nil {
+				return err
+			}
+			req.Header.Set("Accept", "application/json")
+			req.Header.Set("Token", x.QaseToken)
+			var env qaseEnvelope
+			if err := x.do(req, &env); err != nil {
+				return err
+			}
+			if !env.Status {
+				return errors.New("QASE_REJECTED")
+			}
+			if err := json.Unmarshal(env.Result, &list); err != nil {
+				return errors.New("QASE_RESPONSE_INVALID")
+			}
+			// Qase's reported total can lag or over-count filtered items, making a
+			// genuine last page look short. Retry a few times for transient lag,
+			// then accept the page as final rather than failing the whole sync.
+			if list.Total > offset+len(list.Entities) && len(list.Entities) < 100 && attempt < 3 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(time.Duration(attempt+1) * 300 * time.Millisecond):
+				}
+				continue
+			}
+			break
 		}
 		for _, item := range list.Entities {
 			if err := visit(item); err != nil {
 				return err
 			}
-		}
-		if list.Total > offset+len(list.Entities) && len(list.Entities) < 100 {
-			return errors.New("QASE_PAGE_INCOMPLETE")
 		}
 		if len(list.Entities) < 100 || (list.Total > 0 && offset+len(list.Entities) >= list.Total) {
 			return nil
@@ -212,6 +320,105 @@ func (x Connector) QasePagesForRun(ctx context.Context, resource, projectCode st
 	}
 	return errors.New("QASE_OFFSET_LIMIT")
 }
+
+type qaseFieldOption struct {
+	ID    int64  `json:"id"`
+	Title string `json:"title"`
+}
+
+// qaseFieldOptions unwraps a quirk in Qase's own API: for selectbox/multiselect
+// custom fields, "value" comes back as a JSON string containing the array
+// (double-encoded) instead of a native array. Unmarshaling that directly into
+// []qaseFieldOption fails silently upstream, which is why tester-name
+// resolution was always empty — this handles both shapes.
+type qaseFieldOptions []qaseFieldOption
+
+func (o *qaseFieldOptions) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "null" {
+		*o = nil
+		return nil
+	}
+	if strings.HasPrefix(trimmed, `"`) {
+		var inner string
+		if err := json.Unmarshal(data, &inner); err != nil {
+			return err
+		}
+		data = []byte(inner)
+	}
+	var opts []qaseFieldOption
+	if err := json.Unmarshal(data, &opts); err != nil {
+		return err
+	}
+	*o = opts
+	return nil
+}
+
+type qaseCustomField struct {
+	ID     int64            `json:"id"`
+	Title  string           `json:"title"`
+	Entity string           `json:"entity"`
+	Value  qaseFieldOptions `json:"value"`
+}
+
+func (x Connector) QaseCustomFields(ctx context.Context) ([]qaseCustomField, error) {
+	if x.QaseToken == "" {
+		return nil, errors.New("QASE_CONFIG_MISSING")
+	}
+	var out []qaseCustomField
+	for offset := 0; offset <= 100000; offset += 100 {
+		endpoint := fmt.Sprintf("%s/v1/custom_field?limit=100&offset=%d", x.QaseBaseURL, offset)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Token", x.QaseToken)
+		var env qaseEnvelope
+		if err := x.do(req, &env); err != nil {
+			return nil, err
+		}
+		if !env.Status {
+			return nil, errors.New("QASE_REJECTED")
+		}
+		var list struct {
+			Total    int               `json:"total"`
+			Entities []qaseCustomField `json:"entities"`
+		}
+		if err := json.Unmarshal(env.Result, &list); err != nil {
+			return nil, errors.New("QASE_RESPONSE_INVALID")
+		}
+		out = append(out, list.Entities...)
+		if len(list.Entities) < 100 || (list.Total > 0 && offset+len(list.Entities) >= list.Total) {
+			return out, nil
+		}
+	}
+	return nil, errors.New("QASE_OFFSET_LIMIT")
+}
+
+func (x Connector) JiraUserByEmail(ctx context.Context, email string) (string, error) {
+	if x.JiraBaseURL == "" || x.JiraEmail == "" || x.JiraToken == "" || email == "" {
+		return "", errors.New("JIRA_CONFIG_MISSING")
+	}
+	endpoint := fmt.Sprintf("%s/rest/api/3/user/search?query=%s", x.JiraBaseURL, url.QueryEscape(email))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(x.JiraEmail+":"+x.JiraToken)))
+	var users []struct {
+		AccountID string `json:"accountId"`
+	}
+	if err := x.do(req, &users); err != nil {
+		return "", err
+	}
+	if len(users) == 0 {
+		return "", errors.New("JIRA_USER_NOT_FOUND")
+	}
+	return users[0].AccountID, nil
+}
+
 func (x Connector) QaseRun(ctx context.Context, projectCode string, runID int64) (json.RawMessage, error) {
 	if x.QaseToken == "" || x.QaseBaseURL == "" || projectCode == "" || runID <= 0 {
 		return nil, errors.New("QASE_CONFIG_MISSING")
@@ -235,6 +442,102 @@ func (x Connector) QaseRun(ctx context.Context, projectCode string, runID int64)
 	}
 	return env.Result, nil
 }
+
+// QaseRunIDs lists every run for a project, in-progress or finished.
+// ponytail: Qase's own "status=active" filter means "in progress", which
+// drops runs that already finished (e.g. a completed [STG] cycle) — we need
+// those too since project progress is summed across all tracked runs, not
+// just the ones still running.
+func (x Connector) QaseRunIDs(ctx context.Context, projectCode string) ([]int64, error) {
+	if x.QaseToken == "" || projectCode == "" {
+		return nil, errors.New("QASE_CONFIG_MISSING")
+	}
+	var ids []int64
+	for offset := 0; offset <= 100000; offset += 100 {
+		endpoint := fmt.Sprintf("%s/v1/run/%s?limit=100&offset=%d", x.QaseBaseURL, url.PathEscape(projectCode), offset)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Token", x.QaseToken)
+		var env qaseEnvelope
+		if err := x.do(req, &env); err != nil {
+			return nil, err
+		}
+		if !env.Status {
+			return nil, errors.New("QASE_REJECTED")
+		}
+		var list qaseList
+		if err := json.Unmarshal(env.Result, &list); err != nil {
+			return nil, errors.New("QASE_RESPONSE_INVALID")
+		}
+		for _, item := range list.Entities {
+			var run struct {
+				ID int64 `json:"id"`
+			}
+			if err := json.Unmarshal(item, &run); err != nil {
+				return nil, errors.New("QASE_RESPONSE_INVALID")
+			}
+			ids = append(ids, run.ID)
+		}
+		if len(list.Entities) < 100 || (list.Total > 0 && offset+len(list.Entities) >= list.Total) {
+			return ids, nil
+		}
+	}
+	return nil, errors.New("QASE_OFFSET_LIMIT")
+}
+
+type qaseDefect struct {
+	ID           int64    `json:"id"`
+	Title        string   `json:"title"`
+	Status       string   `json:"status"`
+	Severity     string   `json:"severity"`
+	ExternalData string   `json:"external_data"`
+	Runs         []int64  `json:"runs"`
+	Results      []string `json:"results"`
+	// ponytail: Qase's own docs aren't consistent on the field name for a
+	// defect's creation timestamp — accept either, worker.go tries Created
+	// first then CreatedAt.
+	Created   string `json:"created"`
+	CreatedAt string `json:"created_at"`
+}
+
+func (x Connector) QaseDefects(ctx context.Context, projectCode string) ([]qaseDefect, error) {
+	if x.QaseToken == "" || projectCode == "" {
+		return nil, errors.New("QASE_CONFIG_MISSING")
+	}
+	var out []qaseDefect
+	for offset := 0; offset <= 100000; offset += 100 {
+		endpoint := fmt.Sprintf("%s/v1/defect/%s?limit=100&offset=%d", x.QaseBaseURL, url.PathEscape(projectCode), offset)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Token", x.QaseToken)
+		var env qaseEnvelope
+		if err := x.do(req, &env); err != nil {
+			return nil, err
+		}
+		if !env.Status {
+			return nil, errors.New("QASE_REJECTED")
+		}
+		var list struct {
+			Total    int          `json:"total"`
+			Entities []qaseDefect `json:"entities"`
+		}
+		if err := json.Unmarshal(env.Result, &list); err != nil {
+			return nil, errors.New("QASE_RESPONSE_INVALID")
+		}
+		out = append(out, list.Entities...)
+		if len(list.Entities) < 100 || (list.Total > 0 && offset+len(list.Entities) >= list.Total) {
+			return out, nil
+		}
+	}
+	return nil, errors.New("QASE_OFFSET_LIMIT")
+}
+
 func (x Connector) QaseRunCases(ctx context.Context, projectCode string, runID int64) ([]int64, error) {
 	raw, err := x.QaseRun(ctx, projectCode, runID)
 	if err != nil {

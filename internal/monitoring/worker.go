@@ -5,12 +5,36 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Beyondtech-ID/ms-monitoring-qa-be/internal/repository"
 	"github.com/google/uuid"
 )
+
+// ponytail: field IDs hardcoded with env override, not dynamic title-based
+// discovery — single Qase workspace, IDs don't change; if we ever support
+// multiple workspaces, discover by title instead.
+var (
+	qaseFieldIDPic           = envInt64("QASE_FIELD_ID_PIC", 7)
+	qaseFieldIDTester        = envInt64("QASE_FIELD_ID_TESTER", 15)
+	qaseFieldIDTesterAndroid = envInt64("QASE_FIELD_ID_TESTER_ANDROID", 16)
+	qaseFieldIDTesterIos     = envInt64("QASE_FIELD_ID_TESTER_IOS", 17)
+	qaseFieldIDTesterBeta    = envInt64("QASE_FIELD_ID_TESTER_BETA", 21)
+)
+
+func envInt64(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return def
+}
 
 type Worker struct {
 	Repo      *repository.Monitoring
@@ -112,6 +136,8 @@ func (w Worker) process(ctx context.Context, job SyncJob) error {
 			err = w.syncJira(stepCtx, &job, &step)
 		case "qase":
 			err = w.syncQase(stepCtx, &job, &step)
+		case "qase-detail":
+			err = w.syncQaseDetail(stepCtx, &job, &step)
 		default:
 			err = errors.New("UNKNOWN_SOURCE")
 		}
@@ -153,7 +179,7 @@ func (w Worker) process(ctx context.Context, job SyncJob) error {
 func timePtr(t time.Time) *time.Time { return &t }
 func safeCode(err error) string {
 	switch err.Error() {
-	case "JIRA_CONFIG_MISSING", "QASE_CONFIG_MISSING", "UPSTREAM_ACCESS_DENIED", "UPSTREAM_UNAVAILABLE", "UPSTREAM_RETRY_EXHAUSTED", "UPSTREAM_BAD_RESPONSE", "UPSTREAM_JSON_INVALID", "QASE_REJECTED", "QASE_RESPONSE_INVALID", "QASE_OFFSET_LIMIT", "QASE_PAGE_INCOMPLETE", "QASE_RUN_CASES_MISSING", "QASE_RUN_CASES_INVALID", "QASE_CASE_ID_MISSING", "QASE_RUN_ID_MISSING", "QASE_RESULT_ID_MISSING", "QASE_RESULT_RUN_ID_MISSING", "QASE_RESULT_CASE_ID_MISSING", "JIRA_ID_MISSING", "JIRA_CURSOR_MISSING", "JIRA_CURSOR_LOOP", "JIRA_PAGE_LIMIT":
+	case "JIRA_CONFIG_MISSING", "QASE_CONFIG_MISSING", "UPSTREAM_ACCESS_DENIED", "UPSTREAM_UNAVAILABLE", "UPSTREAM_RETRY_EXHAUSTED", "UPSTREAM_BAD_RESPONSE", "UPSTREAM_JSON_INVALID", "QASE_REJECTED", "QASE_RESPONSE_INVALID", "QASE_OFFSET_LIMIT", "QASE_RUN_CASES_MISSING", "QASE_RUN_CASES_INVALID", "QASE_CASE_ID_MISSING", "QASE_RUN_ID_MISSING", "QASE_RESULT_ID_MISSING", "QASE_RESULT_RUN_ID_MISSING", "QASE_RESULT_CASE_ID_MISSING", "JIRA_ID_MISSING", "JIRA_CURSOR_MISSING", "JIRA_CURSOR_LOOP", "JIRA_PAGE_LIMIT", "JIRA_ISSUE_NOT_FOUND":
 		return err.Error()
 	default:
 		return "IMPORT_FAILED"
@@ -162,92 +188,213 @@ func safeCode(err error) string {
 func (w Worker) event(jobID, stepID, level, code, msg string) error {
 	return w.Repo.Event(&SyncEvent{ID: uuid.NewString(), JobID: jobID, StepID: stepID, OccurredAt: time.Now().UTC(), Level: level, Code: code, Message: msg})
 }
+
+const productionBugJQL = `project = BUG AND priority in (Critical, Highest, High) AND status in (Open, "In Progress", Done) ORDER BY created DESC, cf[10019] ASC`
+
+// isCriticalPriority mirrors the frontend's severity() bucketing
+// (dashboard-state.ts) so ranking here matches what's shown as "Critical".
+func isCriticalPriority(name string) bool {
+	p := strings.ToLower(name)
+	return strings.Contains(p, "critical") || strings.Contains(p, "blocker") || p == "highest"
+}
+
+func isHighPriority(name string) bool {
+	p := strings.ToLower(name)
+	return strings.Contains(p, "major") || p == "high"
+}
+
+// productionBugRank orders the production bug list primarily by priority
+// tier (Critical/Highest/Blocker first, then High/Major), and within each
+// tier by status weight (Open first, then In Progress, then Done). Ties
+// keep Jira's own order (created desc, cf[10019] asc), since the sort below
+// is stable.
+func productionBugRank(status, priority string) int {
+	tier := 2
+	switch {
+	case isCriticalPriority(priority):
+		tier = 0
+	case isHighPriority(priority):
+		tier = 1
+	}
+	weight := 3
+	switch {
+	case strings.EqualFold(status, "Open"):
+		weight = 0
+	case strings.EqualFold(status, "In Progress"):
+		weight = 1
+	case strings.EqualFold(status, "Done"):
+		weight = 2
+	}
+	return tier*10 + weight
+}
+
+// syncJira refreshes registered INIT statuses and, for an unscoped sync,
+// replaces the DB-backed production bug snapshot using Jira's exact order.
 func (w Worker) syncJira(ctx context.Context, job *SyncJob, step *SyncStep) error {
-	newest := time.Time{}
-	activeIDs := make([]string, 0)
-	importIssues := func(jql string, projects bool) error {
-		return w.Connector.JiraPages(ctx, jql, func(item jiraIssue) error {
-			step.Fetched++
-			updated := parseTime(item.Fields.Updated)
-			if updated != nil && updated.After(newest) {
-				newest = *updated
-			}
-			existing, found, err := w.Repo.JiraIssue(item.ID)
-			if err != nil {
-				return err
-			}
-			if !found {
-				existing = JiraIssue{ID: uuid.NewString(), ExternalID: item.ID}
-				step.Inserted++
-			} else {
-				step.Updated++
-			}
-			existing.Key = item.Key
-			existing.Summary = item.Fields.Summary
-			existing.Status = item.Fields.Status.Name
-			existing.IssueType = item.Fields.IssueType.Name
-			existing.Creator = item.Fields.Creator.AccountID
-			existing.Reporter = item.Fields.Reporter.AccountID
-			existing.Assignee = item.Fields.Assignee.AccountID
-			existing.SourceUpdatedAt = updated
-			existing.FetchedAt = time.Now().UTC()
-			for _, link := range item.Fields.IssueLinks {
-				for _, target := range [](*struct {
-					ID string `json:"id"`
-				}){link.InwardIssue, link.OutwardIssue} {
-					if target != nil {
-						related, found, err := w.Repo.ProjectByJiraID(target.ID)
-						if err != nil {
-							return err
-						}
-						if found {
-							existing.ProjectID = related.ID
-						}
-					}
-				}
-			}
-			if existing.Severity == "" {
-				existing.Severity = "Unknown"
-			}
-			if err := w.Repo.SaveJiraIssue(&existing); err != nil {
-				return err
-			}
-			// The approved JQL selects active INIT project issues. Create an unmapped project
-			// so Qase scope can be attached explicitly instead of inferred from a title.
-			if projects {
-				activeIDs = append(activeIDs, item.ID)
-				p, found, err := w.Repo.ProjectByJiraID(item.ID)
-				if err != nil {
-					return err
-				}
-				if !found {
-					p = Project{ID: uuid.NewString(), JiraInitID: item.ID, JiraInitKey: item.Key, Name: item.Fields.Summary, Status: item.Fields.Status.Name, Health: "unknown"}
-				} else {
-					p.JiraInitKey = item.Key
-					p.Name = item.Fields.Summary
-					p.Status = item.Fields.Status.Name
-				}
-				if err := w.Repo.SaveProject(&p); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-	}
-	err := importIssues(w.Connector.JiraJQL, true)
-	if err != nil {
-		return err
-	}
-	if err := w.Repo.MarkInactiveProjects(activeIDs); err != nil {
-		return err
-	}
-	if w.Connector.JiraBugJQL != "" {
-		if err := importIssues(w.Connector.JiraBugJQL, false); err != nil {
+	var projects []Project
+	if job.ProjectID != "" {
+		p, err := w.Repo.Project(job.ProjectID)
+		if err != nil {
+			return err
+		}
+		projects = []Project{p}
+	} else {
+		var err error
+		projects, err = w.Repo.Projects(-1, true, "")
+		if err != nil {
 			return err
 		}
 	}
-	return w.cursor("jira", "global", "issues", newest)
+	newest := time.Time{}
+	for _, p := range projects {
+		if p.JiraInitKey == "" {
+			continue
+		}
+		step.Fetched++
+		issue, err := w.Connector.JiraIssue(ctx, p.JiraInitKey)
+		if err != nil {
+			return err
+		}
+		step.Updated++
+		p.JiraInitID = stringPtr(issue.ID)
+		p.Status = issue.Fields.Status.Name
+		if err := w.Repo.SaveProject(&p); err != nil {
+			return err
+		}
+		if updated := parseTime(issue.Fields.Updated); updated != nil && updated.After(newest) {
+			newest = *updated
+		}
+		if err := w.syncJiraBugs(ctx, p, step); err != nil {
+			return err
+		}
+	}
+	if job.ProjectID == "" {
+		bugs := make([]JiraIssue, 0)
+		err := w.Connector.JiraPages(ctx, productionBugJQL, func(issue jiraIssue) error {
+			step.Fetched++
+			bugs = append(bugs, JiraIssue{
+				ID: uuid.NewString(), ExternalID: issue.ID, Key: issue.Key, ProjectID: "BUG", Summary: issue.Fields.Summary,
+				IssueType: issue.Fields.IssueType.Name, Severity: issue.Fields.Priority.Name, Status: issue.Fields.Status.Name,
+				Creator: issue.Fields.Creator.DisplayName, Reporter: issue.Fields.Reporter.DisplayName, Assignee: issue.Fields.Assignee.DisplayName,
+				SourceUpdatedAt: parseTime(issue.Fields.Updated),
+			})
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		sort.SliceStable(bugs, func(i, j int) bool {
+			return productionBugRank(bugs[i].Status, bugs[i].Severity) < productionBugRank(bugs[j].Status, bugs[j].Severity)
+		})
+		fetchedAt := time.Now().UTC()
+		for i := range bugs {
+			bugs[i].FetchedAt = fetchedAt.Add(time.Duration(i) * time.Millisecond)
+		}
+		if err := w.Repo.ReplaceProductionBugs(bugs); err != nil {
+			return err
+		}
+		step.Inserted += len(bugs)
+	}
+	if job.ProjectID == "" {
+		if err := w.syncQAPortfolio(ctx, step); err != nil {
+			return err
+		}
+	}
+	scope := "global"
+	if job.ProjectID != "" {
+		scope = job.ProjectID
+	}
+	return w.cursor("jira", scope, "issues", newest)
 }
+
+// projectBugsJQLTemplate is plan §9.2's per-project bug query, substituting
+// the project's INIT key for the parent clause. One query covers what would
+// otherwise be three separate product queries (Staging/Beta active statuses,
+// plus Invalid-but-Staging), so pagination only runs once per project.
+const projectBugsJQLTemplate = `project = QASE AND parent = "%s" AND ((status IN (Confirm, "In Progress", Open, "Ready for QA", Resolved, Reopened) AND "testing environment[dropdown]" IN (Staging, Beta)) OR (status = Invalid AND "testing environment[dropdown]" = Staging)) ORDER BY created DESC`
+
+// syncJiraBugs makes Jira the source of truth for the bugs dashboard (plan
+// §9.1): a Qase defect linkage is no longer required for an issue to show
+// up. Issues no longer matched by the JQL after a full pagination pass are
+// deactivated (ReplaceProjectBugs), not deleted, so history/audit stays intact.
+func (w Worker) syncJiraBugs(ctx context.Context, project Project, step *SyncStep) error {
+	if project.JiraInitKey == "" {
+		return nil
+	}
+	jql := fmt.Sprintf(projectBugsJQLTemplate, project.JiraInitKey)
+	fetchedAt := time.Now().UTC()
+	issues := make([]JiraIssue, 0)
+	err := w.Connector.JiraPages(ctx, jql, func(issue jiraIssue) error {
+		step.Fetched++
+		issues = append(issues, JiraIssue{
+			ID:              uuid.NewString(),
+			ExternalID:      issue.ID,
+			Key:             issue.Key,
+			Summary:         issue.Fields.Summary,
+			IssueType:       issue.Fields.IssueType.Name,
+			Severity:        issue.Fields.Priority.Name,
+			Status:          issue.Fields.Status.Name,
+			Creator:         issue.Fields.Creator.DisplayName,
+			Reporter:        issue.Fields.Reporter.DisplayName,
+			Assignee:        issue.Fields.Assignee.DisplayName,
+			ParentKey:       project.JiraInitKey,
+			Environment:     repository.ResolveEnvironment(issue.Fields.TestingEnvironment.Value, ""),
+			CreatedAt:       parseTime(issue.Fields.Created),
+			SourceUpdatedAt: parseTime(issue.Fields.Updated),
+			FetchedAt:       fetchedAt,
+		})
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	step.Inserted += len(issues)
+	return w.Repo.ReplaceProjectBugs(project.ID, "project-bugs", issues)
+}
+
+var jiraKeyPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]*-[0-9]+$`)
+
+// syncQAPortfolio refreshes project_qa_assignments (plan §10.2) from Jira's
+// QAs field, once per unscoped sync. No-ops when JIRA_QAS_FIELD_ID is unset
+// (JiraActiveInitsWithQAs returns nil without calling Jira). Only issues
+// matching a registered project's JiraInitKey count; unmatched issues are
+// skipped, since only registered dashboard projects belong in the portfolio.
+func (w Worker) syncQAPortfolio(ctx context.Context, step *SyncStep) error {
+	syncedAt := time.Now().UTC()
+	byProject := map[string][]repository.ProjectQAAssignment{}
+	err := w.Connector.JiraActiveInitsWithQAs(ctx, func(issue jiraIssueWithQAs) error {
+		step.Fetched++
+		project, found, err := w.Repo.ProjectByJiraKey(issue.Key)
+		if err != nil {
+			return err
+		}
+		if !found {
+			step.Skipped++
+			return nil
+		}
+		for _, qa := range issue.QAs {
+			byProject[project.ID] = append(byProject[project.ID], repository.ProjectQAAssignment{
+				JiraAccountID: qa.AccountID,
+				DisplayName:   qa.DisplayName,
+				Active:        true,
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for projectID, assignments := range byProject {
+		if err := w.Repo.ReplaceProjectAssignments(projectID, assignments, syncedAt); err != nil {
+			return err
+		}
+		step.Updated += len(assignments)
+	}
+	return nil
+}
+
+func stringPtr(value string) *string { return &value }
+
 func (w Worker) syncQase(ctx context.Context, job *SyncJob, step *SyncStep) error {
 	projects, err := w.Repo.QaseProjects(job.ProjectID)
 	if err != nil {
@@ -267,73 +414,340 @@ func (w Worker) syncQase(ctx context.Context, job *SyncJob, step *SyncStep) erro
 	}
 	return nil
 }
+
+// syncQaseProjectScope pulls the project's own case/suite totals from a
+// single lightweight Qase project-summary call instead of deriving them by
+// paginating every run's cases. Non-fatal: a failure here just leaves the
+// previously synced scope in place.
+func (w Worker) syncQaseProjectScope(ctx context.Context, code string) {
+	raw, err := w.Connector.QaseProject(ctx, code)
+	if err != nil {
+		return
+	}
+	var parsed struct {
+		Counts struct {
+			Cases  int64 `json:"cases"`
+			Suites int64 `json:"suites"`
+		} `json:"counts"`
+	}
+	if json.Unmarshal(raw, &parsed) != nil {
+		return
+	}
+	_ = w.Repo.UpdateProjectQaseScope(code, parsed.Counts.Cases, parsed.Counts.Suites)
+}
+
+// syncQaseProject runs the "overview" tier only: project scope count, run
+// rows, and the "result" resource (pass/fail/blocked per case) — everything
+// the project-list page and its percentages need. It deliberately skips case
+// titles/tester metadata and defects; see syncQaseProjectDetail for those.
 func (w Worker) syncQaseProject(ctx context.Context, code string, step *SyncStep) error {
-	for _, resource := range []string{"case", "run", "result"} {
-		var newest time.Time
-		err := w.Connector.QasePages(ctx, resource, code, func(raw json.RawMessage) error {
-			step.Fetched++
-			var item map[string]json.RawMessage
-			if err := json.Unmarshal(raw, &item); err != nil {
-				return err
-			}
-			switch resource {
-			case "case":
-				id := number(item, "id")
-				if id == 0 {
-					return errors.New("QASE_CASE_ID_MISSING")
-				}
-				row := QaseCase{ID: uuid.NewString(), ProjectCode: code, CaseID: id, Title: stringValue(item, "title"), UpdatedAt: time.Now().UTC()}
-				return w.upsertCase(&row, step)
-			case "run":
-				id := number(item, "id")
-				if id == 0 {
-					return errors.New("QASE_RUN_ID_MISSING")
-				}
-				row := QaseRun{ID: uuid.NewString(), ProjectCode: code, RunID: id, Title: stringValue(item, "title"), Status: stringValue(item, "status"), Platform: runPlatform(stringValue(item, "title")), Environment: stringValue(item, "environment"), StartedAt: timeValue(item, "start_time"), FinishedAt: timeValue(item, "end_time"), FetchedAt: time.Now().UTC()}
-				if err := w.upsertRun(&row, step); err != nil {
-					return err
-				}
-				caseIDs, err := qaseCaseIDs(item["cases"])
-				if err != nil {
-					caseIDs, err = w.Connector.QaseRunCases(ctx, code, id)
-					if err != nil {
-						return err
-					}
-				}
-				return w.replaceRunCases(code, id, caseIDs)
-			case "result":
-				rid := stringValue(item, "hash")
-				if rid == "" {
-					rid = stringValue(item, "id")
-				}
-				if rid == "" {
-					rid = fmt.Sprint(number(item, "id"))
-				}
-				if rid == "" || rid == "0" {
-					return errors.New("QASE_RESULT_ID_MISSING")
-				}
-				row := QaseResult{ID: uuid.NewString(), ProjectCode: code, ResultID: rid, RunID: number(item, "run_id"), CaseID: number(item, "case_id"), ConfigurationKey: string(item["param"]), Status: stringValue(item, "status"), MemberID: stringValue(item, "member_id"), Environment: stringValue(item, "environment"), StartedAt: timeValue(item, "start_time"), EndedAt: timeValue(item, "end_time"), FetchedAt: time.Now().UTC()}
-				if row.RunID <= 0 {
-					return errors.New("QASE_RESULT_RUN_ID_MISSING")
-				}
-				if row.CaseID <= 0 {
-					return errors.New("QASE_RESULT_CASE_ID_MISSING")
-				}
-				if row.EndedAt != nil && row.EndedAt.After(newest) {
-					newest = *row.EndedAt
-				}
-				return w.upsertResult(&row, step)
-			}
-			return nil
-		})
-		if err != nil {
+	w.syncQaseProjectScope(ctx, code)
+	runIDs, err := w.Connector.QaseRunIDs(ctx, code)
+	if err != nil {
+		return err
+	}
+	for _, runID := range runIDs {
+		if err := w.syncQaseRunOverview(ctx, code, runID, step); err != nil {
 			return err
 		}
-		if err := w.cursor("qase", code, resource, newest); err != nil {
+	}
+	return w.Repo.MarkRunsInactive(code, runIDs)
+}
+
+// syncQaseProjectDetail runs the expensive "detail" tier for one project:
+// case titles + tester/PIC custom-field resolution for every run, plus the
+// defect list (with per-defect Jira enrichment). Only requested when a user
+// opens that project's detail dialog (Team Progress / Jira bugs tabs), never
+// as part of the regular overview sync.
+func (w Worker) syncQaseProjectDetail(ctx context.Context, code string, step *SyncStep) error {
+	runIDs, err := w.Connector.QaseRunIDs(ctx, code)
+	if err != nil {
+		return err
+	}
+	// Non-fatal: if this call fails, the 4 tester-name columns just stay
+	// blank for this sync — case titles etc. still sync fine. Resolved once
+	// per project here rather than once per run.
+	fieldOptions := map[int64]map[int64]string{}
+	if fields, err := w.Connector.QaseCustomFields(ctx); err == nil {
+		for _, f := range fields {
+			opts := make(map[int64]string, len(f.Value))
+			for _, v := range f.Value {
+				opts[v.ID] = v.Title
+			}
+			fieldOptions[f.ID] = opts
+		}
+	}
+	for _, runID := range runIDs {
+		if err := w.syncQaseRunDetail(ctx, code, runID, fieldOptions, step); err != nil {
+			return err
+		}
+	}
+	return w.syncQaseDefects(ctx, code, step)
+}
+
+// syncQaseDetail is the "qase-detail" step dispatcher. Like syncQase's
+// overview tier, an empty job.ProjectID fans out across every registered
+// project (QaseProjects("") returns them all) — this is what the single
+// global "Sync data" job uses for a full sync. A non-empty job.ProjectID
+// scopes it to one project, kept for callers that only need one project's
+// detail tier refreshed.
+func (w Worker) syncQaseDetail(ctx context.Context, job *SyncJob, step *SyncStep) error {
+	projects, err := w.Repo.QaseProjects(job.ProjectID)
+	if err != nil {
+		return err
+	}
+	codes := map[string]bool{}
+	for _, p := range projects {
+		codes[p.QaseProjectCode] = true
+	}
+	if len(codes) == 0 {
+		return errors.New("QASE_CONFIG_MISSING")
+	}
+	for code := range codes {
+		if err := w.syncQaseProjectDetail(ctx, code, step); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// syncQaseDefects imports Qase's per-project defect list, enriching each
+// linked-Jira-issue defect with assignee/reporter/priority pulled from Jira
+// (the source of truth for those fields, not Qase's own severity). Defects
+// aren't run-scoped, so this runs once per project code.
+func (w Worker) syncQaseDefects(ctx context.Context, code string, step *SyncStep) error {
+	defects, err := w.Connector.QaseDefects(ctx, code)
+	if err != nil {
+		return err
+	}
+	for _, d := range defects {
+		step.Fetched++
+		row := QaseDefect{ID: uuid.NewString(), ProjectCode: code, DefectID: d.ID, Title: d.Title, Status: d.Status, UpdatedAt: time.Now().UTC()}
+		row.QaseCreatedAt = parseTime(d.Created)
+		if row.QaseCreatedAt == nil {
+			row.QaseCreatedAt = parseTime(d.CreatedAt)
+		}
+		row.Environment = w.defectEnvironment(code, d.Runs, d.Results)
+		if key := jiraKeyFromExternalData(d.ExternalData); key != "" {
+			row.JiraKey = key
+			// Non-fatal: if this single lookup fails, leave the Jira-sourced
+			// fields blank and keep the defect row itself.
+			if issue, err := w.Connector.JiraIssue(ctx, key); err == nil {
+				row.JiraAssignee = issue.Fields.Assignee.DisplayName
+				row.JiraReporter = issue.Fields.Reporter.DisplayName
+				row.JiraCreator = issue.Fields.Creator.DisplayName
+				row.JiraPriority = issue.Fields.Priority.Name
+				row.JiraStatus = issue.Fields.Status.Name
+				row.JiraCreatedAt = parseTime(issue.Fields.Created)
+				// Jira's own "Testing Environment" field (customfield_10185)
+				// is authoritative — it's set directly on the issue, unlike
+				// the Qase run/result-linkage heuristic below, which only
+				// covers defects Qase itself managed to link to a run.
+				if env := repository.ResolveEnvironment(issue.Fields.TestingEnvironment.Value, ""); env != "" {
+					row.Environment = env
+				}
+			}
+		}
+		existed, err := w.Repo.UpsertDefect(&row)
+		if err != nil {
+			return err
+		}
+		if existed {
+			step.Updated++
+		} else {
+			step.Inserted++
+		}
+	}
+	return nil
+}
+
+// defectEnvironment resolves a defect's environment from a directly linked
+// run, or from its linked result when Qase omits runs (the common case).
+// ponytail: first non-empty match wins even if linked runs span
+// environments — good enough for defect tagging, not worth more nuance.
+func (w Worker) defectEnvironment(code string, runIDs []int64, resultIDs []string) string {
+	for _, id := range runIDs {
+		run, found, err := w.Repo.RunByID(code, id)
+		if err != nil || !found {
+			continue
+		}
+		if env := repository.ResolveEnvironment(run.Environment, run.Title); env != "" {
+			return env
+		}
+	}
+	for _, id := range resultIDs {
+		run, found, err := w.Repo.RunByResultID(code, id)
+		if err != nil || !found {
+			continue
+		}
+		if env := repository.ResolveEnvironment(run.Environment, run.Title); env != "" {
+			return env
+		}
+	}
+	return ""
+}
+func jiraKeyFromExternalData(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	var parsed struct {
+		JiraCloud struct {
+			Key string `json:"key"`
+		} `json:"jira-cloud"`
+	}
+	if json.Unmarshal([]byte(raw), &parsed) != nil {
+		return ""
+	}
+	return parsed.JiraCloud.Key
+}
+
+// fetchRun fetches one run's metadata plus its case-ID membership from Qase.
+// It's a single lightweight call (not a paginated listing), so both the
+// overview and detail tiers can afford to call it independently.
+func (w Worker) fetchRun(ctx context.Context, code string, runID int64, step *SyncStep) (QaseRun, []int64, error) {
+	rawRun, err := w.Connector.QaseRun(ctx, code, runID)
+	if err != nil {
+		return QaseRun{}, nil, err
+	}
+	var runItem map[string]json.RawMessage
+	if err := json.Unmarshal(rawRun, &runItem); err != nil {
+		return QaseRun{}, nil, errors.New("QASE_RESPONSE_INVALID")
+	}
+	if number(runItem, "id") != runID {
+		return QaseRun{}, nil, errors.New("QASE_RUN_ID_MISSING")
+	}
+	step.Fetched++
+	run := QaseRun{ID: uuid.NewString(), ProjectCode: code, RunID: runID, Title: stringValue(runItem, "title"), Status: stringValue(runItem, "status"), Platform: runPlatform(stringValue(runItem, "title")), Environment: stringValue(runItem, "environment"), Active: true, StartedAt: timeValue(runItem, "start_time"), FinishedAt: timeValue(runItem, "end_time"), FetchedAt: time.Now().UTC()}
+	caseIDs, err := qaseCaseIDs(runItem["cases"])
+	if err != nil {
+		caseIDs, err = w.Connector.QaseRunCases(ctx, code, runID)
+		if err != nil {
+			return QaseRun{}, nil, err
+		}
+	}
+	return run, caseIDs, nil
+}
+
+// syncQaseRunOverview upserts the run row and imports only the "result"
+// resource (pass/fail/blocked per case) — the cheap tier needed for the
+// project-list page's run list and percentages. Case titles/tester metadata
+// are NOT fetched here; see syncQaseRunDetail for that expensive tier.
+func (w Worker) syncQaseRunOverview(ctx context.Context, code string, runID int64, step *SyncStep) error {
+	run, caseIDs, err := w.fetchRun(ctx, code, runID, step)
+	if err != nil {
+		return err
+	}
+	if err := w.upsertRun(&run, step); err != nil {
+		return err
+	}
+	if err := w.replaceRunCases(code, runID, caseIDs); err != nil {
+		return err
+	}
+	if err := w.cursor("qase", fmt.Sprintf("%s:%d", code, runID), "run", time.Now().UTC()); err != nil {
+		return err
+	}
+	var newest time.Time
+	caseCache := map[int64]*repository.QaseCase{}
+	err = w.Connector.QasePagesForRun(ctx, "result", code, runID, func(raw json.RawMessage) error {
+		step.Fetched++
+		var item map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &item); err != nil {
+			return err
+		}
+		if number(item, "run_id") != runID {
+			step.Skipped++
+			return nil
+		}
+		rid := stringValue(item, "hash")
+		if rid == "" {
+			rid = stringValue(item, "id")
+		}
+		if rid == "" {
+			rid = fmt.Sprint(number(item, "id"))
+		}
+		if rid == "" || rid == "0" {
+			return errors.New("QASE_RESULT_ID_MISSING")
+		}
+		row := QaseResult{ID: uuid.NewString(), ProjectCode: code, ResultID: rid, RunID: number(item, "run_id"), CaseID: number(item, "case_id"), ConfigurationKey: string(item["param"]), Status: stringValue(item, "status"), MemberID: stringValue(item, "member_id"), Environment: stringValue(item, "environment"), StartedAt: timeValue(item, "start_time"), EndedAt: timeValue(item, "end_time"), FetchedAt: time.Now().UTC()}
+		if row.RunID <= 0 {
+			return errors.New("QASE_RESULT_RUN_ID_MISSING")
+		}
+		if row.CaseID <= 0 {
+			return errors.New("QASE_RESULT_CASE_ID_MISSING")
+		}
+		if row.EndedAt != nil && row.EndedAt.After(newest) {
+			newest = *row.EndedAt
+		}
+		row.TesterName = w.resultTesterSnapshot(code, row.CaseID, repository.ResolveEnvironment(row.Environment, run.Title), caseCache)
+		return w.upsertResult(&row, step)
+	})
+	if err != nil {
+		return err
+	}
+	return w.cursor("qase", fmt.Sprintf("%s:%d", code, runID), "result", newest)
+}
+
+// resultTesterSnapshot resolves the environment-appropriate tester name for
+// a case (STAGING -> QaseCase.TesterName, i.e. "QA Tester"; BETA ->
+// QaseCase.BetaTesterName, i.e. "Field Beta Tester" — never a fallback
+// between the two, see betaTesterColumn's old fallback bug) at the moment a
+// result is first synced. UpsertResult then locks this in permanently, so a
+// later case reassignment in Qase can't rewrite history. Returns "" for any
+// other environment, or if the case hasn't been synced yet (detail-tier sync
+// runs separately from this overview-tier one, see syncQaseProjectDetail).
+func (w Worker) resultTesterSnapshot(code string, caseID int64, environment string, cache map[int64]*repository.QaseCase) string {
+	qc, ok := cache[caseID]
+	if !ok {
+		if found, err := w.Repo.CaseByID(code, caseID); err == nil {
+			qc = &found
+		}
+		cache[caseID] = qc
+	}
+	if qc == nil {
+		return ""
+	}
+	switch environment {
+	case "STAGING":
+		return qc.TesterName
+	case "BETA":
+		return qc.BetaTesterName
+	default:
+		return ""
+	}
+}
+
+// syncQaseRunDetail imports the "case" resource (title + tester/PIC custom
+// fields) for one run — the expensive part of a Qase sync (paginates every
+// case and resolves tester names), only needed by the project detail
+// dialog's Team Progress tab. fieldOptions is resolved once per project by
+// the caller rather than once per run.
+func (w Worker) syncQaseRunDetail(ctx context.Context, code string, runID int64, fieldOptions map[int64]map[int64]string, step *SyncStep) error {
+	_, caseIDs, err := w.fetchRun(ctx, code, runID, step)
+	if err != nil {
+		return err
+	}
+	allowedCases := make(map[int64]bool, len(caseIDs))
+	for _, caseID := range caseIDs {
+		allowedCases[caseID] = true
+	}
+	return w.Connector.QasePagesForRun(ctx, "case", code, runID, func(raw json.RawMessage) error {
+		step.Fetched++
+		var item map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &item); err != nil {
+			return err
+		}
+		id := number(item, "id")
+		if !allowedCases[id] {
+			step.Skipped++
+			return nil
+		}
+		if id == 0 {
+			return errors.New("QASE_CASE_ID_MISSING")
+		}
+		row := QaseCase{ID: uuid.NewString(), ProjectCode: code, CaseID: id, Title: stringValue(item, "title"), UpdatedAt: time.Now().UTC()}
+		applyQaseTesterFields(&row, item["custom_fields"], fieldOptions)
+		return w.upsertCase(&row, step)
+	})
 }
 func (w Worker) replaceRunCases(code string, runID int64, caseIDs []int64) error {
 	return w.Repo.ReplaceRunCases(code, runID, caseIDs)
@@ -416,12 +830,76 @@ func parseTime(s string) *time.Time {
 	}
 	return nil
 }
-func runPlatform(title string) string {
-	title = strings.ToUpper(title)
-	for _, p := range []string{"AOS", "IOS", "BO", "DB", "APO"} {
-		if strings.Contains(title, "[STG] "+p) {
-			return p
+func applyQaseTesterFields(row *QaseCase, raw json.RawMessage, fieldOptions map[int64]map[int64]string) {
+	if len(raw) == 0 {
+		return
+	}
+	var entries []struct {
+		ID    int64  `json:"id"`
+		Value string `json:"value"`
+	}
+	if json.Unmarshal(raw, &entries) != nil {
+		return
+	}
+	for _, e := range entries {
+		opts := fieldOptions[e.ID]
+		if opts == nil {
+			continue
 		}
+		var titles []string
+		for _, tok := range strings.Split(e.Value, ",") {
+			tok = strings.TrimSpace(tok)
+			if tok == "" {
+				continue
+			}
+			optID, err := strconv.ParseInt(tok, 10, 64)
+			if err != nil {
+				continue
+			}
+			if title, ok := opts[optID]; ok {
+				titles = append(titles, title)
+			}
+		}
+		if len(titles) == 0 {
+			continue
+		}
+		joined := strings.Join(titles, ", ")
+		switch e.ID {
+		case qaseFieldIDPic:
+			row.PicNames = joined
+		case qaseFieldIDTester:
+			row.TesterName = joined
+		case qaseFieldIDTesterAndroid:
+			row.TesterAndroidName = joined
+		case qaseFieldIDTesterIos:
+			row.TesterIosName = joined
+		case qaseFieldIDTesterBeta:
+			row.BetaTesterName = joined
+		}
+	}
+}
+
+// runPlatform detects the platform from a run title regardless of which
+// environment tag prefixes it ("[STG] ", "[BETA] ", or none) — real run
+// titles use human names ("[BETA] APO Main", "[STG] Android"), not just the
+// literal platform codes, so this strips any leading "[TAG] " and matches
+// keywords in what's left.
+func runPlatform(title string) string {
+	upper := strings.ToUpper(title)
+	if idx := strings.Index(upper, "] "); idx != -1 {
+		upper = upper[idx+2:]
+	}
+	switch {
+	case strings.Contains(upper, "IOS"):
+		return "IOS"
+	case strings.Contains(upper, "AOS"), strings.Contains(upper, "ANDROID"):
+		return "AOS"
+	case strings.Contains(upper, "APO"):
+		return "APO"
+	case strings.Contains(upper, "BO"):
+		return "BO"
+	case strings.Contains(upper, "DB"):
+		return "DB"
 	}
 	return "unknown"
 }
