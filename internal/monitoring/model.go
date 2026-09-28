@@ -10,6 +10,7 @@ type QaseCase = repository.QaseCase
 type QaseRun = repository.QaseRun
 type QaseRunCase = repository.QaseRunCase
 type QaseResult = repository.QaseResult
+type QaseDefect = repository.QaseDefect
 type SyncJob = repository.SyncJob
 type SyncStep = repository.SyncStep
 type SyncEvent = repository.SyncEvent

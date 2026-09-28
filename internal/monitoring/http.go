@@ -1,6 +1,7 @@
 package monitoring
 
 import (
+	"context"
 	"crypto/subtle"
 	"errors"
 	"net/http"
@@ -29,15 +30,19 @@ type envelope struct {
 }
 type projectView struct {
 	Project
-	Counts          repository.Counts       `json:"counts"`
-	CountsAvailable bool                    `json:"countsAvailable"`
-	Runs            []repository.ProjectRun `json:"runs"`
+	Counts          repository.Counts                 `json:"counts"`
+	CountsAvailable bool                              `json:"countsAvailable"`
+	Runs            []repository.ProjectRun           `json:"runs"`
+	TesterProgress  []repository.TesterProgress       `json:"testerProgress"`
+	DailyExecutions []repository.TesterDailyExecution `json:"dailyExecutions"`
+	StagingCounts   repository.Counts                 `json:"stagingCounts"`
+	BetaCounts      repository.Counts                 `json:"betaCounts"`
+	BugSummary      repository.ProjectBugSummary      `json:"bugSummary"`
 }
 type projectRegistration struct {
 	JiraInitKey     string `json:"jiraInitKey"`
 	Name            string `json:"name"`
 	QaseProjectCode string `json:"qaseProjectCode"`
-	QaseTestRunID   int64  `json:"qaseTestRunId"`
 	QAOwner         string `json:"qaOwner"`
 	StagingStartAt  string `json:"stagingStartAt"`
 	StagingEndAt    string `json:"stagingEndAt"`
@@ -53,7 +58,7 @@ func (r *projectRegistration) validate() (projectSchedule, error) {
 	r.Name = strings.TrimSpace(r.Name)
 	r.QaseProjectCode = strings.ToUpper(strings.TrimSpace(r.QaseProjectCode))
 	r.QAOwner = strings.TrimSpace(r.QAOwner)
-	if !jiraKeyPattern.MatchString(r.JiraInitKey) || r.Name == "" || r.QaseProjectCode == "" || r.QaseTestRunID <= 0 || r.QAOwner == "" {
+	if !jiraKeyPattern.MatchString(r.JiraInitKey) || r.Name == "" || r.QaseProjectCode == "" || r.QAOwner == "" {
 		return projectSchedule{}, errors.New("missing required project field")
 	}
 	values := []string{r.StagingStartAt, r.StagingEndAt, r.BetaStartAt, r.BetaEndAt}
@@ -73,19 +78,65 @@ func (r *projectRegistration) validate() (projectSchedule, error) {
 
 type memberRegistration struct {
 	Name                string  `json:"name"`
-	JiraAccountID       string  `json:"jiraAccountId"`
-	QaseMemberID        string  `json:"qaseMemberId"`
+	JiraEmail           string  `json:"jiraEmail"`
+	QaseDisplayName     string  `json:"qaseDisplayName"`
 	WeeklyCapacityHours float64 `json:"weeklyCapacityHours"`
+}
+type memberResponse struct {
+	repository.Member
+	Warnings map[string]string `json:"warnings,omitempty"`
 }
 
 func (r *memberRegistration) validate() error {
 	r.Name = strings.TrimSpace(r.Name)
-	r.JiraAccountID = strings.TrimSpace(r.JiraAccountID)
-	r.QaseMemberID = strings.TrimSpace(r.QaseMemberID)
+	r.JiraEmail = strings.TrimSpace(r.JiraEmail)
+	r.QaseDisplayName = strings.TrimSpace(r.QaseDisplayName)
 	if r.Name == "" || r.WeeklyCapacityHours < 0 {
 		return errors.New("missing required member field")
 	}
 	return nil
+}
+
+// resolveJiraEmail resolves a Jira login email to an accountId. A
+// not-found email yields a soft warning; any other error (network/auth)
+// is skipped silently so a flaky third-party API never blocks the save.
+func (a API) resolveJiraEmail(ctx context.Context, email string) (accountID, warning string) {
+	if email == "" {
+		return "", ""
+	}
+	id, err := a.Connector.JiraUserByEmail(ctx, email)
+	if err != nil {
+		if err.Error() == "JIRA_USER_NOT_FOUND" {
+			return "", "Email '" + email + "' tidak ditemukan di Jira."
+		}
+		return "", ""
+	}
+	return id, ""
+}
+
+// resolveQaseDisplayName checks the given name against the live QA
+// PIC/Tester/Tester Android/Tester IOS option titles and returns a soft
+// warning when it doesn't exactly match any of them.
+func (a API) resolveQaseDisplayName(ctx context.Context, name string) (warning string) {
+	if name == "" {
+		return ""
+	}
+	fields, err := a.Connector.QaseCustomFields(ctx)
+	if err != nil {
+		return ""
+	}
+	wanted := map[int64]bool{qaseFieldIDPic: true, qaseFieldIDTester: true, qaseFieldIDTesterAndroid: true, qaseFieldIDTesterIos: true}
+	for _, f := range fields {
+		if !wanted[f.ID] {
+			continue
+		}
+		for _, v := range f.Value {
+			if v.Title == name {
+				return ""
+			}
+		}
+	}
+	return "Nama '" + name + "' tidak ditemukan di opsi QA PIC/QA Tester di Qase saat ini."
 }
 
 func invalidMember(c echo.Context) error {
@@ -104,15 +155,23 @@ func (a API) Register(e *echo.Echo) {
 	g.GET("/workflow", a.workflow)
 	g.GET("/workload", a.workload)
 	g.GET("/bugs", a.bugs)
+	g.GET("/production-bugs", a.productionBugs)
 	g.POST("/sync-jobs", a.createJob, a.managerAuth)
 	g.GET("/sync-jobs", a.jobs)
 	g.GET("/sync-jobs/:id", a.job)
+	a.RegisterDocumentationRoutes(g)
 }
 func (a API) managerAuth(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		key := os.Getenv("MONITOR_MANAGER_API_KEY")
+		// ponytail: unset key means the gate is off (single QA manager uses
+		// this dashboard, no RBAC exists) — set MONITOR_MANAGER_API_KEY to
+		// turn it back on, no code change needed.
+		if key == "" {
+			return next(c)
+		}
 		provided := c.Request().Header.Get("X-Manager-Key")
-		if key == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(key)) != 1 {
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(key)) != 1 {
 			return c.JSON(http.StatusForbidden, map[string]string{"code": "FORBIDDEN", "message": "manager authorization required"})
 		}
 		return next(c)
@@ -160,7 +219,7 @@ func safeError(c echo.Context, err error) error {
 }
 func limit(c echo.Context) int {
 	n, _ := strconv.Atoi(c.QueryParam("limit"))
-	if n < 1 || n > 100 {
+	if n < 1 || n > 500 {
 		return 50
 	}
 	return n
@@ -181,7 +240,27 @@ func (a API) projects(c echo.Context) error {
 		if err != nil {
 			return safeError(c, err)
 		}
-		result = append(result, projectView{Project: p, Counts: counts, CountsAvailable: available, Runs: runs})
+		testerProgress, err := a.Repo.ProjectTesterBreakdown(p)
+		if err != nil {
+			return safeError(c, err)
+		}
+		dailyExecutions, err := a.Repo.ProjectTesterDailyExecutions(p)
+		if err != nil {
+			return safeError(c, err)
+		}
+		stagingCounts, err := a.Repo.ProjectEnvironmentCounts(p, "STAGING")
+		if err != nil {
+			return safeError(c, err)
+		}
+		betaCounts, err := a.Repo.ProjectEnvironmentCounts(p, "BETA")
+		if err != nil {
+			return safeError(c, err)
+		}
+		bugSummary, err := a.Repo.ProjectBugSummary(p)
+		if err != nil {
+			return safeError(c, err)
+		}
+		result = append(result, projectView{Project: p, Counts: counts, CountsAvailable: available, Runs: runs, TesterProgress: testerProgress, DailyExecutions: dailyExecutions, StagingCounts: stagingCounts, BetaCounts: betaCounts, BugSummary: bugSummary})
 	}
 	return a.send(c, result)
 }
@@ -201,7 +280,27 @@ func (a API) project(c echo.Context) error {
 	if err != nil {
 		return safeError(c, err)
 	}
-	return a.send(c, projectView{Project: p, Counts: counts, CountsAvailable: available, Runs: runs})
+	testerProgress, err := a.Repo.ProjectTesterBreakdown(p)
+	if err != nil {
+		return safeError(c, err)
+	}
+	dailyExecutions, err := a.Repo.ProjectTesterDailyExecutions(p)
+	if err != nil {
+		return safeError(c, err)
+	}
+	stagingCounts, err := a.Repo.ProjectEnvironmentCounts(p, "STAGING")
+	if err != nil {
+		return safeError(c, err)
+	}
+	betaCounts, err := a.Repo.ProjectEnvironmentCounts(p, "BETA")
+	if err != nil {
+		return safeError(c, err)
+	}
+	bugSummary, err := a.Repo.ProjectBugSummary(p)
+	if err != nil {
+		return safeError(c, err)
+	}
+	return a.send(c, projectView{Project: p, Counts: counts, CountsAvailable: available, Runs: runs, TesterProgress: testerProgress, DailyExecutions: dailyExecutions, StagingCounts: stagingCounts, BetaCounts: betaCounts, BugSummary: bugSummary})
 }
 func (a API) createProject(c echo.Context) error {
 	var req projectRegistration
@@ -213,7 +312,8 @@ func (a API) createProject(c echo.Context) error {
 		return invalidProject(c)
 	}
 	ctx := c.Request().Context()
-	if _, err := a.Connector.JiraIssue(ctx, req.JiraInitKey); err != nil {
+	issue, err := a.Connector.JiraIssue(ctx, req.JiraInitKey)
+	if err != nil {
 		if err.Error() == "JIRA_CONFIG_MISSING" {
 			return c.JSON(http.StatusServiceUnavailable, map[string]string{"code": "JIRA_CONFIG_MISSING", "message": "Jira integration is not configured"})
 		}
@@ -225,16 +325,25 @@ func (a API) createProject(c echo.Context) error {
 		}
 		return c.JSON(http.StatusUnprocessableEntity, map[string]string{"code": "QASE_PROJECT_NOT_FOUND", "message": "qaseProjectCode could not be validated against Qase"})
 	}
-	p, err := a.Repo.SaveProjectMapping(req.JiraInitKey, req.Name, req.QaseProjectCode, req.QaseTestRunID, req.QAOwner, schedule.stagingStart, schedule.stagingEnd, schedule.betaStart, schedule.betaEnd)
+	p, err := a.Repo.SaveProjectMapping(req.JiraInitKey, req.Name, req.QaseProjectCode, req.QAOwner, schedule.stagingStart, schedule.stagingEnd, schedule.betaStart, schedule.betaEnd)
 	if errors.Is(err, repository.ErrJiraInitMapped) {
 		return c.JSON(http.StatusConflict, map[string]string{"code": "JIRA_INIT_ALREADY_REGISTERED", "message": "jiraInitKey is already registered"})
 	}
 	if errors.Is(err, repository.ErrQaseRunMapped) {
-		return c.JSON(http.StatusConflict, map[string]string{"code": "QASE_RUN_ALREADY_REGISTERED", "message": "qaseProjectCode and qaseTestRunId are already registered"})
+		return c.JSON(http.StatusConflict, map[string]string{"code": "QASE_RUN_ALREADY_REGISTERED", "message": "qaseProjectCode is already registered"})
 	}
 	if err != nil {
 		return safeError(c, err)
 	}
+	p.JiraInitID = stringPtr(issue.ID)
+	p.Status = issue.Fields.Status.Name
+	if err := a.Repo.SaveProject(&p); err != nil {
+		return safeError(c, err)
+	}
+	// Non-fatal: the project is already saved; a failed auto-enqueue just
+	// means it waits for the next scheduled or manual sync instead.
+	job := SyncJob{ID: uuid.NewString(), RequestKey: uuid.NewString(), Trigger: "project_created", Status: "queued", Sources: "jira,qase", ProjectID: p.ID, RequestedAt: time.Now().UTC(), Actor: "system"}
+	_, _ = a.Repo.EnqueueIfAbsent(&job, []string{"jira", "qase"})
 	return c.JSON(http.StatusCreated, p)
 }
 func (a API) members(c echo.Context) error {
@@ -264,11 +373,24 @@ func (a API) createMember(c echo.Context) error {
 	if err := req.validate(); err != nil {
 		return invalidMember(c)
 	}
-	v := Member{ID: uuid.NewString(), Name: req.Name, JiraAccountID: req.JiraAccountID, QaseMemberID: req.QaseMemberID, WeeklyCapacityHours: req.WeeklyCapacityHours, Active: true}
+	ctx := c.Request().Context()
+	warnings := map[string]string{}
+	accountID, warn := a.resolveJiraEmail(ctx, req.JiraEmail)
+	if warn != "" {
+		warnings["jiraEmail"] = warn
+	}
+	if warn := a.resolveQaseDisplayName(ctx, req.QaseDisplayName); warn != "" {
+		warnings["qaseDisplayName"] = warn
+	}
+	v := Member{ID: uuid.NewString(), Name: req.Name, JiraEmail: req.JiraEmail, JiraAccountID: accountID, QaseDisplayName: req.QaseDisplayName, WeeklyCapacityHours: req.WeeklyCapacityHours, Active: true}
 	if err := a.Repo.SaveMember(&v); err != nil {
 		return safeError(c, err)
 	}
-	return c.JSON(http.StatusCreated, v)
+	resp := memberResponse{Member: v}
+	if len(warnings) > 0 {
+		resp.Warnings = warnings
+	}
+	return c.JSON(http.StatusCreated, resp)
 }
 
 func (a API) updateMember(c echo.Context) error {
@@ -281,8 +403,8 @@ func (a API) updateMember(c echo.Context) error {
 	}
 	var req struct {
 		Name                *string  `json:"name"`
-		JiraAccountID       *string  `json:"jiraAccountId"`
-		QaseMemberID        *string  `json:"qaseMemberId"`
+		JiraEmail           *string  `json:"jiraEmail"`
+		QaseDisplayName     *string  `json:"qaseDisplayName"`
 		WeeklyCapacityHours *float64 `json:"weeklyCapacityHours"`
 		Active              *bool    `json:"active"`
 	}
@@ -292,11 +414,23 @@ func (a API) updateMember(c echo.Context) error {
 	if req.Name != nil {
 		v.Name = strings.TrimSpace(*req.Name)
 	}
-	if req.JiraAccountID != nil {
-		v.JiraAccountID = strings.TrimSpace(*req.JiraAccountID)
+	ctx := c.Request().Context()
+	warnings := map[string]string{}
+	if req.JiraEmail != nil {
+		email := strings.TrimSpace(*req.JiraEmail)
+		v.JiraEmail = email
+		accountID, warn := a.resolveJiraEmail(ctx, email)
+		v.JiraAccountID = accountID
+		if warn != "" {
+			warnings["jiraEmail"] = warn
+		}
 	}
-	if req.QaseMemberID != nil {
-		v.QaseMemberID = strings.TrimSpace(*req.QaseMemberID)
+	if req.QaseDisplayName != nil {
+		name := strings.TrimSpace(*req.QaseDisplayName)
+		v.QaseDisplayName = name
+		if warn := a.resolveQaseDisplayName(ctx, name); warn != "" {
+			warnings["qaseDisplayName"] = warn
+		}
 	}
 	if req.WeeklyCapacityHours != nil {
 		v.WeeklyCapacityHours = *req.WeeklyCapacityHours
@@ -310,11 +444,15 @@ func (a API) updateMember(c echo.Context) error {
 	if err := a.Repo.SaveMember(&v); err != nil {
 		return safeError(c, err)
 	}
-	return c.JSON(http.StatusOK, v)
+	resp := memberResponse{Member: v}
+	if len(warnings) > 0 {
+		resp.Warnings = warnings
+	}
+	return c.JSON(http.StatusOK, resp)
 }
 
 func invalidProject(c echo.Context) error {
-	return c.JSON(http.StatusBadRequest, map[string]string{"code": "INVALID_PROJECT", "message": "jiraInitKey, name, qaseProjectCode, qaseTestRunId, qaOwner and valid staging/beta ranges are required"})
+	return c.JSON(http.StatusBadRequest, map[string]string{"code": "INVALID_PROJECT", "message": "jiraInitKey, name, qaseProjectCode, qaOwner and valid staging/beta ranges are required"})
 }
 func dateRange(c echo.Context) (time.Time, time.Time, error) {
 	now := time.Now().UTC()
@@ -362,13 +500,37 @@ func (a API) workload(c echo.Context) error {
 	return a.send(c, map[string]any{"period": map[string]string{"from": from.Format("2006-01-02"), "to": to.Add(-time.Nanosecond).Format("2006-01-02")}, "members": members})
 }
 func (a API) bugs(c echo.Context) error {
-	rows, err := a.Repo.Bugs(limit(c), c.QueryParam("projectId"), c.QueryParam("severity"), c.QueryParam("status"), c.QueryParam("q"))
+	page, pageSize := documentPage(c)
+	rows, err := a.Repo.JiraBugs(page, pageSize, c.QueryParam("projectId"), c.QueryParam("environment"), c.QueryParam("reporter"), c.QueryParam("status"), c.QueryParam("priority"), c.QueryParam("q"))
 	if err != nil {
 		return safeError(c, err)
 	}
 	return a.send(c, rows)
 }
 
+func (a API) productionBugs(c echo.Context) error {
+	page, _ := strconv.Atoi(c.QueryParam("page"))
+	if page < 1 {
+		page = 1
+	}
+	pageSize, _ := strconv.Atoi(c.QueryParam("pageSize"))
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 10
+	}
+	rows, err := a.Repo.ProductionBugs(page, pageSize)
+	if err != nil {
+		return safeError(c, err)
+	}
+	return a.send(c, rows)
+}
+
+// createJob's sources may be any combination, each at most once, of: "jira"
+// and "qase" (the cheap overview tier) and "qase-detail" (the expensive
+// per-project case/tester/defect tier). scope.projectId is optional for all
+// of them — omitted, a source fans out across every registered project;
+// set, it scopes to just that one. The single global "Sync data" button
+// requests all three sources unscoped in one job, so its progress can be
+// polled from one place.
 func (a API) createJob(c echo.Context) error {
 	var req struct {
 		Scope struct {
@@ -384,8 +546,8 @@ func (a API) createJob(c echo.Context) error {
 	}
 	seen := map[string]bool{}
 	for _, s := range req.Sources {
-		if (s != "jira" && s != "qase") || seen[s] {
-			return c.JSON(http.StatusBadRequest, map[string]string{"code": "INVALID_SOURCE", "message": "sources must contain jira and/or qase once"})
+		if (s != "jira" && s != "qase" && s != "qase-detail") || seen[s] {
+			return c.JSON(http.StatusBadRequest, map[string]string{"code": "INVALID_SOURCE", "message": "sources must be one or more of jira, qase, qase-detail (each once)"})
 		}
 		seen[s] = true
 	}
