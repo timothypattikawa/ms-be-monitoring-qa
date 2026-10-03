@@ -138,6 +138,14 @@ func (w Worker) process(ctx context.Context, job SyncJob) error {
 			err = w.syncQase(stepCtx, &job, &step)
 		case "qase-detail":
 			err = w.syncQaseDetail(stepCtx, &job, &step)
+		case "production-bugs":
+			err = w.syncProductionBugs(stepCtx, &step)
+		case "qa-portfolio":
+			if os.Getenv("JIRA_QAS_FIELD_ID") == "" {
+				err = errors.New("JIRA_QAS_FIELD_MISSING")
+			} else {
+				err = w.syncQAPortfolio(stepCtx, &step)
+			}
 		default:
 			err = errors.New("UNKNOWN_SOURCE")
 		}
@@ -179,7 +187,7 @@ func (w Worker) process(ctx context.Context, job SyncJob) error {
 func timePtr(t time.Time) *time.Time { return &t }
 func safeCode(err error) string {
 	switch err.Error() {
-	case "JIRA_CONFIG_MISSING", "QASE_CONFIG_MISSING", "UPSTREAM_ACCESS_DENIED", "UPSTREAM_UNAVAILABLE", "UPSTREAM_RETRY_EXHAUSTED", "UPSTREAM_BAD_RESPONSE", "UPSTREAM_JSON_INVALID", "QASE_REJECTED", "QASE_RESPONSE_INVALID", "QASE_OFFSET_LIMIT", "QASE_RUN_CASES_MISSING", "QASE_RUN_CASES_INVALID", "QASE_CASE_ID_MISSING", "QASE_RUN_ID_MISSING", "QASE_RESULT_ID_MISSING", "QASE_RESULT_RUN_ID_MISSING", "QASE_RESULT_CASE_ID_MISSING", "JIRA_ID_MISSING", "JIRA_CURSOR_MISSING", "JIRA_CURSOR_LOOP", "JIRA_PAGE_LIMIT", "JIRA_ISSUE_NOT_FOUND":
+	case "JIRA_CONFIG_MISSING", "QASE_CONFIG_MISSING", "UPSTREAM_ACCESS_DENIED", "UPSTREAM_UNAVAILABLE", "UPSTREAM_RETRY_EXHAUSTED", "UPSTREAM_BAD_RESPONSE", "UPSTREAM_JSON_INVALID", "QASE_REJECTED", "QASE_RESPONSE_INVALID", "QASE_OFFSET_LIMIT", "QASE_RUN_CASES_MISSING", "QASE_RUN_CASES_INVALID", "QASE_CASE_ID_MISSING", "QASE_RUN_ID_MISSING", "QASE_RESULT_ID_MISSING", "QASE_RESULT_RUN_ID_MISSING", "QASE_RESULT_CASE_ID_MISSING", "JIRA_QAS_FIELD_MISSING", "JIRA_ID_MISSING", "JIRA_CURSOR_MISSING", "JIRA_CURSOR_LOOP", "JIRA_PAGE_LIMIT", "JIRA_ISSUE_NOT_FOUND":
 		return err.Error()
 	default:
 		return "IMPORT_FAILED"
@@ -189,47 +197,41 @@ func (w Worker) event(jobID, stepID, level, code, msg string) error {
 	return w.Repo.Event(&SyncEvent{ID: uuid.NewString(), JobID: jobID, StepID: stepID, OccurredAt: time.Now().UTC(), Level: level, Code: code, Message: msg})
 }
 
-const productionBugJQL = `project = BUG AND priority in (Critical, Highest, High) AND status in (Open, "In Progress", Done) ORDER BY created DESC, cf[10019] ASC`
+// productionBugJQL is product's production-bug query; its ORDER BY (newest
+// created first) is the display order, persisted as-is via fetched_at.
+const productionBugJQL = `project = BUG AND status in (Confirm, Done, "In Progress", "To Do") ORDER BY created DESC, cf[10019] ASC`
 
-// isCriticalPriority mirrors the frontend's severity() bucketing
-// (dashboard-state.ts) so ranking here matches what's shown as "Critical".
-func isCriticalPriority(name string) bool {
-	p := strings.ToLower(name)
-	return strings.Contains(p, "critical") || strings.Contains(p, "blocker") || p == "highest"
-}
-
-func isHighPriority(name string) bool {
-	p := strings.ToLower(name)
-	return strings.Contains(p, "major") || p == "high"
-}
-
-// productionBugRank orders the production bug list primarily by priority
-// tier (Critical/Highest/Blocker first, then High/Major), and within each
-// tier by status weight (Open first, then In Progress, then Done). Ties
-// keep Jira's own order (created desc, cf[10019] asc), since the sort below
-// is stable.
-func productionBugRank(status, priority string) int {
-	tier := 2
-	switch {
-	case isCriticalPriority(priority):
-		tier = 0
-	case isHighPriority(priority):
-		tier = 1
+// syncProductionBugs replaces the DB-backed production bug snapshot using
+// Jira's exact order. It is the whole "production-bugs" source (the Bugs page's
+// dedicated sync button) and also the tail of an unscoped "jira" sync.
+func (w Worker) syncProductionBugs(ctx context.Context, step *SyncStep) error {
+	bugs := make([]JiraIssue, 0)
+	err := w.Connector.JiraPages(ctx, productionBugJQL, func(issue jiraIssue) error {
+		step.Fetched++
+		bugs = append(bugs, JiraIssue{
+			ID: uuid.NewString(), ExternalID: issue.ID, Key: issue.Key, ProjectID: "BUG", Summary: issue.Fields.Summary,
+			IssueType: issue.Fields.IssueType.Name, Severity: issue.Fields.Priority.Name, Status: issue.Fields.Status.Name,
+			Creator: issue.Fields.Creator.DisplayName, Reporter: issue.Fields.Reporter.DisplayName, Assignee: issue.Fields.Assignee.DisplayName,
+			CreatedAt: parseTime(issue.Fields.Created), SourceUpdatedAt: parseTime(issue.Fields.Updated),
+		})
+		return nil
+	})
+	if err != nil {
+		return err
 	}
-	weight := 3
-	switch {
-	case strings.EqualFold(status, "Open"):
-		weight = 0
-	case strings.EqualFold(status, "In Progress"):
-		weight = 1
-	case strings.EqualFold(status, "Done"):
-		weight = 2
+	fetchedAt := time.Now().UTC()
+	for i := range bugs {
+		bugs[i].FetchedAt = fetchedAt.Add(time.Duration(i) * time.Millisecond)
 	}
-	return tier*10 + weight
+	if err := w.Repo.ReplaceProductionBugs(bugs); err != nil {
+		return err
+	}
+	step.Inserted += len(bugs)
+	return nil
 }
 
 // syncJira refreshes registered INIT statuses and, for an unscoped sync,
-// replaces the DB-backed production bug snapshot using Jira's exact order.
+// the production bug snapshot and QA portfolio.
 func (w Worker) syncJira(ctx context.Context, job *SyncJob, step *SyncStep) error {
 	var projects []Project
 	if job.ProjectID != "" {
@@ -269,31 +271,9 @@ func (w Worker) syncJira(ctx context.Context, job *SyncJob, step *SyncStep) erro
 		}
 	}
 	if job.ProjectID == "" {
-		bugs := make([]JiraIssue, 0)
-		err := w.Connector.JiraPages(ctx, productionBugJQL, func(issue jiraIssue) error {
-			step.Fetched++
-			bugs = append(bugs, JiraIssue{
-				ID: uuid.NewString(), ExternalID: issue.ID, Key: issue.Key, ProjectID: "BUG", Summary: issue.Fields.Summary,
-				IssueType: issue.Fields.IssueType.Name, Severity: issue.Fields.Priority.Name, Status: issue.Fields.Status.Name,
-				Creator: issue.Fields.Creator.DisplayName, Reporter: issue.Fields.Reporter.DisplayName, Assignee: issue.Fields.Assignee.DisplayName,
-				SourceUpdatedAt: parseTime(issue.Fields.Updated),
-			})
-			return nil
-		})
-		if err != nil {
+		if err := w.syncProductionBugs(ctx, step); err != nil {
 			return err
 		}
-		sort.SliceStable(bugs, func(i, j int) bool {
-			return productionBugRank(bugs[i].Status, bugs[i].Severity) < productionBugRank(bugs[j].Status, bugs[j].Severity)
-		})
-		fetchedAt := time.Now().UTC()
-		for i := range bugs {
-			bugs[i].FetchedAt = fetchedAt.Add(time.Duration(i) * time.Millisecond)
-		}
-		if err := w.Repo.ReplaceProductionBugs(bugs); err != nil {
-			return err
-		}
-		step.Inserted += len(bugs)
 	}
 	if job.ProjectID == "" {
 		if err := w.syncQAPortfolio(ctx, step); err != nil {
@@ -307,11 +287,12 @@ func (w Worker) syncJira(ctx context.Context, job *SyncJob, step *SyncStep) erro
 	return w.cursor("jira", scope, "issues", newest)
 }
 
-// projectBugsJQLTemplate is plan §9.2's per-project bug query, substituting
-// the project's INIT key for the parent clause. One query covers what would
-// otherwise be three separate product queries (Staging/Beta active statuses,
-// plus Invalid-but-Staging), so pagination only runs once per project.
-const projectBugsJQLTemplate = `project = QASE AND parent = "%s" AND ((status IN (Confirm, "In Progress", Open, "Ready for QA", Resolved, Reopened) AND "testing environment[dropdown]" IN (Staging, Beta)) OR (status = Invalid AND "testing environment[dropdown]" = Staging)) ORDER BY created DESC`
+// projectBugsJQLTemplate is product's own confirmed per-project bug query
+// (one for Staging, one for Beta, merged here via testing-environment IN
+// (...) so pagination only runs once per project), substituting the
+// project's INIT key for the parent clause. Invalid applies to both
+// environments equally, matching product's queries exactly.
+const projectBugsJQLTemplate = `project = QASE AND parent = "%s" AND status IN (Confirm, "In Progress", Open, "Ready for QA", Resolved, Invalid, Reopened) AND "testing environment[dropdown]" IN (Staging, Beta) ORDER BY created DESC`
 
 // syncJiraBugs makes Jira the source of truth for the bugs dashboard (plan
 // §9.1): a Qase defect linkage is no longer required for an issue to show
@@ -354,42 +335,50 @@ func (w Worker) syncJiraBugs(ctx context.Context, project Project, step *SyncSte
 
 var jiraKeyPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]*-[0-9]+$`)
 
-// syncQAPortfolio refreshes project_qa_assignments (plan §10.2) from Jira's
-// QAs field, once per unscoped sync. No-ops when JIRA_QAS_FIELD_ID is unset
-// (JiraActiveInitsWithQAs returns nil without calling Jira). Only issues
-// matching a registered project's JiraInitKey count; unmatched issues are
-// skipped, since only registered dashboard projects belong in the portfolio.
+// syncQAPortfolio refreshes the QA portfolio from Jira's QAs field: it swaps
+// the jira_init_qas snapshot (every INIT with a QA, any status — registered
+// on the dashboard or not) and creates a member for each Jira QA that has none
+// yet (active, Qase display name left empty for the QA lead to map). It runs
+// as the "qa-portfolio" source and at the tail of an unscoped "jira" sync, and
+// no-ops while JIRA_QAS_FIELD_ID is unset. The snapshot is only replaced after
+// the whole Jira query succeeded, so a failed run keeps the previous data.
 func (w Worker) syncQAPortfolio(ctx context.Context, step *SyncStep) error {
+	if os.Getenv("JIRA_QAS_FIELD_ID") == "" {
+		return nil
+	}
 	syncedAt := time.Now().UTC()
-	byProject := map[string][]repository.ProjectQAAssignment{}
-	err := w.Connector.JiraActiveInitsWithQAs(ctx, func(issue jiraIssueWithQAs) error {
+	var rows []repository.JiraInitQA
+	users := map[string]repository.Member{}
+	seen := map[string]bool{}
+	err := w.Connector.JiraInitsWithQAs(ctx, func(issue jiraIssueWithQAs) error {
 		step.Fetched++
-		project, found, err := w.Repo.ProjectByJiraKey(issue.Key)
-		if err != nil {
-			return err
-		}
-		if !found {
-			step.Skipped++
-			return nil
-		}
 		for _, qa := range issue.QAs {
-			byProject[project.ID] = append(byProject[project.ID], repository.ProjectQAAssignment{
-				JiraAccountID: qa.AccountID,
-				DisplayName:   qa.DisplayName,
-				Active:        true,
-			})
+			if qa.AccountID == "" || seen[issue.Key+"|"+qa.AccountID] {
+				continue
+			}
+			seen[issue.Key+"|"+qa.AccountID] = true
+			rows = append(rows, repository.JiraInitQA{InitKey: issue.Key, JiraAccountID: qa.AccountID, DisplayName: qa.DisplayName, InitName: issue.Summary, InitStatus: issue.Status, SyncedAt: syncedAt})
+			users[qa.AccountID] = repository.Member{Name: qa.DisplayName, JiraAccountID: qa.AccountID, JiraEmail: qa.EmailAddress}
 		}
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	for projectID, assignments := range byProject {
-		if err := w.Repo.ReplaceProjectAssignments(projectID, assignments, syncedAt); err != nil {
-			return err
-		}
-		step.Updated += len(assignments)
+	if err := w.Repo.ReplaceJiraInitQAs(rows); err != nil {
+		return err
 	}
+	list := make([]repository.Member, 0, len(users))
+	for _, u := range users {
+		list = append(list, u)
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+	created, err := w.Repo.EnsureJiraMembers(list)
+	if err != nil {
+		return err
+	}
+	step.Updated += len(rows)
+	step.Inserted += created
 	return nil
 }
 

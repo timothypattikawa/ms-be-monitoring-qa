@@ -1,0 +1,1 @@
+-- Non-destructive: renamed document types are kept as-is on rollback.

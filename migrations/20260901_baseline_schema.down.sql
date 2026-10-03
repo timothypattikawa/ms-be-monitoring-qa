@@ -1,0 +1,2 @@
+-- Intentionally non-destructive: dropping the baseline would delete all synced Jira/Qase data.
+-- DBA-reviewed cleanup, if ever needed, belongs in a separate migration.

@@ -417,7 +417,7 @@ func TestJiraIssueIncludesEnrichmentFields(t *testing.T) {
 	}
 }
 
-func TestJiraActiveInitsWithQAs(t *testing.T) {
+func TestJiraInitsWithQAs(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		fieldID    string
@@ -430,11 +430,11 @@ func TestJiraActiveInitsWithQAs(t *testing.T) {
 			wantCalled: false,
 		},
 		{
-			name:       "parses key and QAs array from configured field",
+			name:       "parses key, summary, status and QAs array from configured field",
 			fieldID:    "customfield_10099",
 			wantCalled: true,
 			wantIssues: []jiraIssueWithQAs{
-				{Key: "INIT-1", QAs: []jiraQAUser{{AccountID: "acc1", DisplayName: "Nadia"}, {AccountID: "acc2", DisplayName: "Kiki"}}},
+				{Key: "INIT-1", Summary: "Checkout", Status: "QA", QAs: []jiraQAUser{{AccountID: "acc1", DisplayName: "Nadia", EmailAddress: "nadia@example.com"}, {AccountID: "acc2", DisplayName: "Kiki"}}},
 			},
 		},
 	} {
@@ -459,12 +459,12 @@ func TestJiraActiveInitsWithQAs(t *testing.T) {
 				if request.JQL != qaPortfolioJQL {
 					t.Fatalf("JQL = %q, want %q", request.JQL, qaPortfolioJQL)
 				}
-				_, _ = w.Write([]byte(`{"issues":[{"key":"INIT-1","fields":{"customfield_10099":[{"accountId":"acc1","displayName":"Nadia"},{"accountId":"acc2","displayName":"Kiki"}]}}],"isLast":true}`))
+				_, _ = w.Write([]byte(`{"issues":[{"key":"INIT-1","fields":{"summary":"Checkout","status":{"name":"QA"},"customfield_10099":[{"accountId":"acc1","displayName":"Nadia","emailAddress":"nadia@example.com"},{"accountId":"acc2","displayName":"Kiki"}]}}],"isLast":true}`))
 			}))
 			defer srv.Close()
 			x := Connector{Client: srv.Client(), JiraBaseURL: srv.URL, JiraEmail: "qa@example.com", JiraToken: "token"}
 			var got []jiraIssueWithQAs
-			err := x.JiraActiveInitsWithQAs(context.Background(), func(issue jiraIssueWithQAs) error {
+			err := x.JiraInitsWithQAs(context.Background(), func(issue jiraIssueWithQAs) error {
 				got = append(got, issue)
 				return nil
 			})
@@ -478,7 +478,7 @@ func TestJiraActiveInitsWithQAs(t *testing.T) {
 				t.Fatalf("got %+v, want %+v", got, tc.wantIssues)
 			}
 			for i := range got {
-				if got[i].Key != tc.wantIssues[i].Key || len(got[i].QAs) != len(tc.wantIssues[i].QAs) {
+				if got[i].Key != tc.wantIssues[i].Key || got[i].Summary != tc.wantIssues[i].Summary || got[i].Status != tc.wantIssues[i].Status || len(got[i].QAs) != len(tc.wantIssues[i].QAs) {
 					t.Fatalf("got %+v, want %+v", got[i], tc.wantIssues[i])
 				}
 				for j := range got[i].QAs {

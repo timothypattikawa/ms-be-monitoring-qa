@@ -18,6 +18,7 @@ import (
 type API struct {
 	Repo      *repository.Monitoring
 	Connector Connector
+	Solr      Solr
 }
 type sourceState struct {
 	Status   string     `json:"status"`
@@ -30,24 +31,33 @@ type envelope struct {
 }
 type projectView struct {
 	Project
-	Counts          repository.Counts                 `json:"counts"`
-	CountsAvailable bool                              `json:"countsAvailable"`
-	Runs            []repository.ProjectRun           `json:"runs"`
-	TesterProgress  []repository.TesterProgress       `json:"testerProgress"`
-	DailyExecutions []repository.TesterDailyExecution `json:"dailyExecutions"`
-	StagingCounts   repository.Counts                 `json:"stagingCounts"`
-	BetaCounts      repository.Counts                 `json:"betaCounts"`
-	BugSummary      repository.ProjectBugSummary      `json:"bugSummary"`
+	Counts           repository.Counts                 `json:"counts"`
+	CountsAvailable  bool                              `json:"countsAvailable"`
+	Runs             []repository.ProjectRun           `json:"runs"`
+	TesterProgress   []repository.TesterProgress       `json:"testerProgress"`
+	AssigneeProgress []repository.TesterProgress       `json:"assigneeProgress"`
+	DailyExecutions  []repository.TesterDailyExecution `json:"dailyExecutions"`
+	StagingCounts    repository.Counts                 `json:"stagingCounts"`
+	BetaCounts       repository.Counts                 `json:"betaCounts"`
+	BugSummary       repository.ProjectBugSummary      `json:"bugSummary"`
 }
+
+// allowedProjectSizes is plan §6.1's fixed size enum, mirrored by the
+// projects.project_size CHECK constraint (migrations/20260928_bug_dashboard_additive.up.sql).
+var allowedProjectSizes = map[string]bool{"S": true, "M": true, "L": true, "XL": true, "2XL": true, "3XL": true, "4L": true, "5L": true}
+
 type projectRegistration struct {
-	JiraInitKey     string `json:"jiraInitKey"`
-	Name            string `json:"name"`
-	QaseProjectCode string `json:"qaseProjectCode"`
-	QAOwner         string `json:"qaOwner"`
-	StagingStartAt  string `json:"stagingStartAt"`
-	StagingEndAt    string `json:"stagingEndAt"`
-	BetaStartAt     string `json:"betaStartAt"`
-	BetaEndAt       string `json:"betaEndAt"`
+	JiraInitKey        string  `json:"jiraInitKey"`
+	Name               string  `json:"name"`
+	QaseProjectCode    string  `json:"qaseProjectCode"`
+	QAOwner            string  `json:"qaOwner"`
+	ProjectSize        *string `json:"projectSize"`
+	StagingMtttMinutes *int    `json:"stagingMtttMinutes"`
+	BetaMtttMinutes    *int    `json:"betaMtttMinutes"`
+	StagingStartAt     string  `json:"stagingStartAt"`
+	StagingEndAt       string  `json:"stagingEndAt"`
+	BetaStartAt        string  `json:"betaStartAt"`
+	BetaEndAt          string  `json:"betaEndAt"`
 }
 type projectSchedule struct {
 	stagingStart, stagingEnd, betaStart, betaEnd time.Time
@@ -60,6 +70,22 @@ func (r *projectRegistration) validate() (projectSchedule, error) {
 	r.QAOwner = strings.TrimSpace(r.QAOwner)
 	if !jiraKeyPattern.MatchString(r.JiraInitKey) || r.Name == "" || r.QaseProjectCode == "" || r.QAOwner == "" {
 		return projectSchedule{}, errors.New("missing required project field")
+	}
+	if r.ProjectSize != nil {
+		size := strings.ToUpper(strings.TrimSpace(*r.ProjectSize))
+		if size == "" {
+			r.ProjectSize = nil
+		} else if !allowedProjectSizes[size] {
+			return projectSchedule{}, errors.New("invalid project size")
+		} else {
+			r.ProjectSize = &size
+		}
+	}
+	if r.StagingMtttMinutes != nil && *r.StagingMtttMinutes < 0 {
+		return projectSchedule{}, errors.New("stagingMtttMinutes must not be negative")
+	}
+	if r.BetaMtttMinutes != nil && *r.BetaMtttMinutes < 0 {
+		return projectSchedule{}, errors.New("betaMtttMinutes must not be negative")
 	}
 	values := []string{r.StagingStartAt, r.StagingEndAt, r.BetaStartAt, r.BetaEndAt}
 	times := make([]time.Time, len(values))
@@ -160,6 +186,7 @@ func (a API) Register(e *echo.Echo) {
 	g.GET("/sync-jobs", a.jobs)
 	g.GET("/sync-jobs/:id", a.job)
 	a.RegisterDocumentationRoutes(g)
+	a.RegisterKnowledgeRoutes(g)
 }
 func (a API) managerAuth(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
@@ -284,6 +311,10 @@ func (a API) project(c echo.Context) error {
 	if err != nil {
 		return safeError(c, err)
 	}
+	assigneeProgress, err := a.Repo.ProjectAssigneeProgress(p)
+	if err != nil {
+		return safeError(c, err)
+	}
 	dailyExecutions, err := a.Repo.ProjectTesterDailyExecutions(p)
 	if err != nil {
 		return safeError(c, err)
@@ -300,7 +331,7 @@ func (a API) project(c echo.Context) error {
 	if err != nil {
 		return safeError(c, err)
 	}
-	return a.send(c, projectView{Project: p, Counts: counts, CountsAvailable: available, Runs: runs, TesterProgress: testerProgress, DailyExecutions: dailyExecutions, StagingCounts: stagingCounts, BetaCounts: betaCounts, BugSummary: bugSummary})
+	return a.send(c, projectView{Project: p, Counts: counts, CountsAvailable: available, Runs: runs, TesterProgress: testerProgress, AssigneeProgress: assigneeProgress, DailyExecutions: dailyExecutions, StagingCounts: stagingCounts, BetaCounts: betaCounts, BugSummary: bugSummary})
 }
 func (a API) createProject(c echo.Context) error {
 	var req projectRegistration
@@ -325,7 +356,7 @@ func (a API) createProject(c echo.Context) error {
 		}
 		return c.JSON(http.StatusUnprocessableEntity, map[string]string{"code": "QASE_PROJECT_NOT_FOUND", "message": "qaseProjectCode could not be validated against Qase"})
 	}
-	p, err := a.Repo.SaveProjectMapping(req.JiraInitKey, req.Name, req.QaseProjectCode, req.QAOwner, schedule.stagingStart, schedule.stagingEnd, schedule.betaStart, schedule.betaEnd)
+	p, err := a.Repo.SaveProjectMappingWithMetadata(req.JiraInitKey, req.Name, req.QaseProjectCode, req.QAOwner, req.ProjectSize, req.StagingMtttMinutes, req.BetaMtttMinutes, schedule.stagingStart, schedule.stagingEnd, schedule.betaStart, schedule.betaEnd)
 	if errors.Is(err, repository.ErrJiraInitMapped) {
 		return c.JSON(http.StatusConflict, map[string]string{"code": "JIRA_INIT_ALREADY_REGISTERED", "message": "jiraInitKey is already registered"})
 	}
@@ -499,8 +530,25 @@ func (a API) workload(c echo.Context) error {
 	}
 	return a.send(c, map[string]any{"period": map[string]string{"from": from.Format("2006-01-02"), "to": to.Add(-time.Nanosecond).Format("2006-01-02")}, "members": members})
 }
+
+// bugsPage clamps pageSize higher than documentPage's: the dashboard does a
+// single bulk "load every registered-project bug" fetch (pageSize=1000) to
+// populate client-side grouping/filtering, on top of the normal paginated
+// Bugs page table (pageSize=20). The 2000 ceiling gives headroom above the
+// current ~700-bug total as more projects/history accumulate.
+func bugsPage(c echo.Context) (int, int) {
+	page, _ := strconv.Atoi(c.QueryParam("page"))
+	pageSize, _ := strconv.Atoi(c.QueryParam("pageSize"))
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 2000 {
+		pageSize = 20
+	}
+	return page, pageSize
+}
 func (a API) bugs(c echo.Context) error {
-	page, pageSize := documentPage(c)
+	page, pageSize := bugsPage(c)
 	rows, err := a.Repo.JiraBugs(page, pageSize, c.QueryParam("projectId"), c.QueryParam("environment"), c.QueryParam("reporter"), c.QueryParam("status"), c.QueryParam("priority"), c.QueryParam("q"))
 	if err != nil {
 		return safeError(c, err)
@@ -526,7 +574,8 @@ func (a API) productionBugs(c echo.Context) error {
 
 // createJob's sources may be any combination, each at most once, of: "jira"
 // and "qase" (the cheap overview tier) and "qase-detail" (the expensive
-// per-project case/tester/defect tier). scope.projectId is optional for all
+// per-project case/tester/defect tier), plus "production-bugs" (only the Jira
+// BUG-project snapshot, for the Bugs page's own sync button). scope.projectId is optional for all
 // of them — omitted, a source fans out across every registered project;
 // set, it scopes to just that one. The single global "Sync data" button
 // requests all three sources unscoped in one job, so its progress can be
@@ -546,8 +595,8 @@ func (a API) createJob(c echo.Context) error {
 	}
 	seen := map[string]bool{}
 	for _, s := range req.Sources {
-		if (s != "jira" && s != "qase" && s != "qase-detail") || seen[s] {
-			return c.JSON(http.StatusBadRequest, map[string]string{"code": "INVALID_SOURCE", "message": "sources must be one or more of jira, qase, qase-detail (each once)"})
+		if (s != "jira" && s != "qase" && s != "qase-detail" && s != "production-bugs" && s != "qa-portfolio") || seen[s] {
+			return c.JSON(http.StatusBadRequest, map[string]string{"code": "INVALID_SOURCE", "message": "sources must be one or more of jira, qase, qase-detail, production-bugs, qa-portfolio (each once)"})
 		}
 		seen[s] = true
 	}

@@ -159,31 +159,29 @@ func TestSyncJiraBugsInvalidStatusCountsAsCanceledOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Total != 2 || summary.Staging != 2 {
-		t.Fatalf("expected both issues fetched and environment-tagged, got %+v", summary)
+	if summary.Total != 1 || summary.Staging != 1 {
+		t.Fatalf("expected the Invalid issue excluded from Total/Staging, got %+v", summary)
 	}
 	if summary.Canceled != 1 {
 		t.Fatalf("expected only the Invalid-status issue counted as canceled, got %+v", summary)
 	}
 }
 
-func TestSyncQAPortfolioPersistsAssignmentsForRegisteredProjectsOnly(t *testing.T) {
+// TestSyncQAPortfolioStoresEveryInitAndCreatesUnmappedMembers: every INIT with
+// a QA is stored in any status (registered on the dashboard or not), Jira QAs
+// without a member get one (active, empty Qase display name), and existing
+// members are left alone.
+func TestSyncQAPortfolioStoresEveryInitAndCreatesUnmappedMembers(t *testing.T) {
 	repo := repository.NewSQLiteForTest(t)
 	now := time.Now().UTC()
-	if _, err := repo.SaveProjectMapping("INIT-1", "Checkout Revamp", "CHK", "Kiki", now, now, now, now); err != nil {
-		t.Fatal(err)
-	}
 	if err := repo.SaveMember(&repository.Member{ID: "m1", Name: "Nadia", JiraAccountID: "acc1", Active: true}); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("JIRA_QAS_FIELD_ID", "customfield_10099")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// INIT-1 is registered and has two QAs (one mapped to a member, one
-		// not); INIT-UNREGISTERED has no matching registered project and
-		// must be skipped entirely.
 		_, _ = w.Write([]byte(`{"issues":[
-			{"key":"INIT-1","fields":{"customfield_10099":[{"accountId":"acc1","displayName":"Nadia"},{"accountId":"acc-unmapped","displayName":"Ghost"}]}},
-			{"key":"INIT-UNREGISTERED","fields":{"customfield_10099":[{"accountId":"acc1","displayName":"Nadia"}]}}
+			{"key":"INIT-1","fields":{"summary":"Checkout","status":{"name":"QA"},"customfield_10099":[{"accountId":"acc1","displayName":"Nadia"},{"accountId":"acc-new","displayName":"Ghost","emailAddress":"ghost@example.com"}]}},
+			{"key":"INIT-2","fields":{"summary":"Legacy","status":{"name":"Done"},"customfield_10099":[{"accountId":"acc1","displayName":"Nadia"},{"accountId":"acc1","displayName":"Nadia"}]}}
 		],"isLast":true}`))
 	}))
 	defer srv.Close()
@@ -192,19 +190,29 @@ func TestSyncQAPortfolioPersistsAssignmentsForRegisteredProjectsOnly(t *testing.
 	if err := w.syncQAPortfolio(t.Context(), step); err != nil {
 		t.Fatal(err)
 	}
+	if step.Fetched != 2 || step.Updated != 3 || step.Inserted != 1 {
+		t.Fatalf("unexpected step counters: %+v", step)
+	}
 
 	members, err := repo.Workload(now.Add(-time.Hour), now.Add(time.Hour), "m1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(members) != 1 {
-		t.Fatalf("got %d workload members, want 1", len(members))
+	if len(members) != 1 || members[0].TotalProjects != 2 || members[0].ActiveProjects != 1 || members[0].Projects[0].Key != "INIT-1" || members[0].Projects[0].Status != "QA" {
+		t.Fatalf("unexpected portfolio: %+v", members)
 	}
-	if members[0].ActiveProjects != 1 || members[0].TotalProjects != 1 {
-		t.Fatalf("unexpected project counts: %+v", members[0])
+	all, err := repo.Members(true)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(members[0].Projects) != 1 || members[0].Projects[0].Key != "INIT-1" {
-		t.Fatalf("unexpected projects: %+v", members[0].Projects)
+	var ghost *repository.Member
+	for i := range all {
+		if all[i].JiraAccountID == "acc-new" {
+			ghost = &all[i]
+		}
+	}
+	if len(all) != 2 || ghost == nil || !ghost.Active || ghost.QaseDisplayName != "" || ghost.JiraEmail != "ghost@example.com" {
+		t.Fatalf("expected an active, unmapped member for the new Jira QA, got %+v", all)
 	}
 }
 
@@ -226,25 +234,56 @@ func TestSyncQAPortfolioNoopsWhenFieldIDUnset(t *testing.T) {
 	}
 }
 
-func TestProductionBugRankOrdersCriticalTierFirstThenOpenBeforeInProgressBeforeDone(t *testing.T) {
-	cases := []struct {
-		status, priority string
-		want             int
-	}{
-		{"Open", "Highest", 0},
-		{"Open", "Blocker", 0},
-		{"In Progress", "Critical", 1},
-		{"Done", "Highest", 2},
-		{"Open", "High", 10},
-		{"In Progress", "High", 11},
-		{"Done", "High", 12},
-		{"Confirm", "Medium", 23},
-		{"Confirm", "Low", 23},
+// TestSyncProductionBugsOnlyTouchesTheBugSnapshot: the dedicated
+// "production-bugs" source runs only the BUG query (no INIT/project calls) and
+// replaces the previous snapshot.
+func TestSyncProductionBugsOnlyTouchesTheBugSnapshot(t *testing.T) {
+	repo := repository.NewSQLiteForTest(t)
+	if err := repo.ReplaceProductionBugs([]repository.JiraIssue{{ID: "old", ExternalID: "old", Key: "BUG-OLD", ProjectID: "BUG"}}); err != nil {
+		t.Fatal(err)
 	}
-	for _, c := range cases {
-		if got := productionBugRank(c.status, c.priority); got != c.want {
-			t.Errorf("productionBugRank(%q, %q) = %d, want %d", c.status, c.priority, got, c.want)
-		}
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_, _ = w.Write([]byte(`{"issues":[{"id":"9","key":"BUG-9","fields":{"summary":"fresh","status":{"name":"To Do"},"priority":{"name":"High"}}}],"isLast":true}`))
+	}))
+	defer srv.Close()
+	w := Worker{Repo: repo, Connector: Connector{Client: srv.Client(), JiraBaseURL: srv.URL, JiraEmail: "qa@example.com", JiraToken: "token"}}
+	step := &SyncStep{}
+	if err := w.syncProductionBugs(t.Context(), step); err != nil {
+		t.Fatal(err)
+	}
+	page, err := repo.ProductionBugs(1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || page.Total != 1 || page.Items[0].Key != "BUG-9" || step.Inserted != 1 {
+		t.Fatalf("calls=%d page=%+v step=%+v", calls, page, step)
+	}
+}
+
+// TestSyncJiraKeepsProductionBugsInJiraCreatedOrder: the production bug list
+// is shown newest-created first, exactly as the JQL returns it — no re-ranking.
+func TestSyncJiraKeepsProductionBugsInJiraCreatedOrder(t *testing.T) {
+	repo := repository.NewSQLiteForTest(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"issues":[
+			{"id":"3","key":"BUG-3","fields":{"summary":"newest","status":{"name":"To Do"},"priority":{"name":"Low"},"created":"2026-09-29T10:00:00.000+0700"}},
+			{"id":"2","key":"BUG-2","fields":{"summary":"middle","status":{"name":"Done"},"priority":{"name":"Highest"},"created":"2026-09-20T10:00:00.000+0700"}},
+			{"id":"1","key":"BUG-1","fields":{"summary":"oldest","status":{"name":"Confirm"},"priority":{"name":"High"},"created":"2026-09-01T10:00:00.000+0700"}}
+		],"isLast":true}`))
+	}))
+	defer srv.Close()
+	w := Worker{Repo: repo, Connector: Connector{Client: srv.Client(), JiraBaseURL: srv.URL, JiraEmail: "qa@example.com", JiraToken: "token"}}
+	if err := w.syncJira(t.Context(), &SyncJob{}, &SyncStep{}); err != nil {
+		t.Fatal(err)
+	}
+	page, err := repo.ProductionBugs(1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 3 || page.Items[0].Key != "BUG-3" || page.Items[1].Key != "BUG-2" || page.Items[2].Key != "BUG-1" {
+		t.Fatalf("expected Jira's newest-first order, got %+v", page.Items)
 	}
 }
 

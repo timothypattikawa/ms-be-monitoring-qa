@@ -1,0 +1,4 @@
+-- Intentionally non-destructive. The release plan keeps additive columns and
+-- data available when the application is rolled back. DBA-reviewed destructive
+-- cleanup, if ever needed, belongs in a separate migration after data retention
+-- has been confirmed.

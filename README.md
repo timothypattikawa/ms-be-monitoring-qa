@@ -16,8 +16,8 @@ go run ./cmd
 go run ./cmd/worker
 ```
 
-The API uses the existing `.env` settings (`APP_HOST=127.0.0.1`,
-`APP_PORT=3002` locally). The worker claims PostgreSQL jobs with
+The API uses the existing `.env` settings (`APP_HOST` and `APP_PORT`; the
+current local setup serves on `127.0.0.1:8080`). The worker claims PostgreSQL jobs with
 `FOR UPDATE SKIP LOCKED`; it enqueues scheduled jobs at 08:00 and 17:00
 Asia/Jakarta. `POST /api/v1/sync-jobs` enqueues a manual job and requires
 `X-Manager-Key` matching `MONITOR_MANAGER_API_KEY`. If that variable is
@@ -33,46 +33,112 @@ Set these only in runtime secrets/environment, never in Angular or Git:
 | `JIRA_BASE_URL` | Jira Cloud site origin, such as `https://example.atlassian.net` |
 | `JIRA_EMAIL` | Jira account used for Basic auth |
 | `JIRA_API_TOKEN` | Jira API token for that account |
-| `JIRA_ACTIVE_JQL` | Approved active INIT JQL; the supplied QA filtered JQL may be used temporarily |
-| `JIRA_BUG_JQL` | Approved JQL for linked bug issues; unset means Bugs remains empty |
 | `QASE_API_TOKEN` | Read token sent in Qase's `Token` header |
 | `QASE_BASE_URL` | Optional; defaults to `https://api.qase.io` |
 | `MONITOR_MANAGER_API_KEY` | Temporary manager write gate |
 
-Load the approved JQL directly from the supplied file at runtime. Quoting the
-path is required because its filename contains spaces and parentheses:
+No JQL configuration is needed. Bugs come from Qase's Defect API
+(`GET /v1/defect/{qaseProjectCode}`), scoped per registered project code; each
+defect's `external_data` carries the linked Jira key (`jira-cloud.key`), used
+for a single-issue Jira lookup to enrich `assignee`/`reporter`/`priority`/`status`/`createdAt` (the
+source of truth for "how critical" and "what state", not Qase's own severity/status). `environment`
+is resolved from the defect's linked Qase run(s) via the same run-environment normalization used for
+project runs. Defects with no linked Jira issue simply sync without those Jira-sourced fields,
+falling back to Qase's own status/created timestamp. INIT status is refreshed
+per-project via the same single-issue Jira lookup, not a broad JQL scan.
 
-```bash
-export JIRA_ACTIVE_JQL="$(cat '/absolute/path/project = INIT AND status not in (C.txt')"
-go run ./cmd/worker
+Register the authoritative INIT-to-Qase-project mapping before syncing a project:
+
+```json
+{
+  "jiraInitKey": "INIT-386",
+  "name": "Refund Alfagift",
+  "qaseProjectCode": "INIT",
+  "qaOwner": "QA Team",
+  "stagingStartAt": "2026-09-01T00:00:00Z",
+  "stagingEndAt": "2026-09-05T00:00:00Z",
+  "betaStartAt": "2026-09-06T00:00:00Z",
+  "betaEndAt": "2026-09-10T00:00:00Z"
+}
 ```
 
-This keeps the query out of shell history, source files, and committed `.env`
-files. The Jira base URL, bug mapping JQL, and INIT-to-Qase project codes are
-still required before a real sync can be complete.
+Send this body to `POST /api/v1/projects` with the runtime manager key. All
+fields are required. Dates use RFC3339 and each end must be at or after its
+start. A repeated `jiraInitKey` returns `409`. Jira's internal issue ID is
+resolved (via a single-issue lookup) and returned as `jiraInitId`; users do
+not enter it. A successful create also auto-enqueues a `jira,qase` sync job
+scoped to the new project, so it doesn't wait for the next scheduled sync.
 
-**Required mapping:** Each Jira INIT needs a verified Qase project code in
-`projects.qase_project_code`. Jira issue links or an approved field must
-connect bugs to an INIT. The attached JQL filters to one QA account; confirm
-whether that is the intended dashboard scope before treating its counts as
-team wide. A Qase run title such as `[STG] AOS` supplies a platform label;
-environment is a separate stored field. The worker does not invent an
-INIT ↔ Qase mapping from names. Project counts are marked
-`countsAvailable=false` until run membership and a unique mapping exist.
+**Required mapping:** Each Jira INIT needs a verified Qase project code. There
+is no run ID to enter — every sync asks Qase which runs are currently
+`active` for that project code and tracks all of them at once (a Qase project
+typically has several parallel active runs, e.g. one per platform/scope).
+A run that later closes stops counting once it's no longer in the active set;
+its already-synced rows stay in the database. A Qase run title such as `[STG] AOS` supplies a
+platform label; environment is a separate stored field. The worker does not
+invent an INIT ↔ Qase mapping from names. Project counts are marked
+`countsAvailable=false` until run membership exists for at least one active
+run.
+
+Each project response also includes `runs`. The array contains one entry per
+currently-active Qase run and is empty until at least one has been synced:
+
+```json
+{
+  "runId": 77,
+  "title": "[STG] AOS",
+  "environment": "STAGING",
+  "platform": "AOS",
+  "scope": "AOS",
+  "ownerId": "qase-member-123",
+  "passed": 27,
+  "failed": 8,
+  "blocked": 0,
+  "total": 126,
+  "startedAt": "2026-09-01T01:00:00Z",
+  "finishedAt": "2026-09-01T02:00:00Z",
+  "elapsedSeconds": 3600
+}
+```
+
+Counts use the latest result for each case in the selected run. `ownerId` is
+the stable member ID on the latest stored result and can be empty when Qase
+has not supplied one. Environment values containing `STAGING`/`STG` or
+`BETA` are normalized to `STAGING` or `BETA`. A recognized `[STG]`,
+`[STAGING]`, or `[BETA]` run-title marker is used only when the environment
+field is empty; other explicit source values are retained in uppercase.
+Timestamps and elapsed time stay `null` when the source does not
+provide enough data. The API does not calculate velocity, ETA, or capacity
+from these values.
 
 `GET /api/v1/projects`, `/workflow`, `/workload`, `/bugs`, `/sync-jobs`, and
 `/sync-jobs/{id}` return `{asOf,sources,data}`. Source status is `fresh`,
 `stale`, or `never_synced`; staleness currently means older than 24 hours.
-`POST /api/v1/projects` saves/updates a mapping and enqueues validation;
+`POST /api/v1/projects` registers a mapping and enqueues validation;
 `POST /api/v1/sync-jobs` returns `202` and a job with steps/events. Qase
-backfill pages cases, runs, run membership and results at 100 records per
-request. Run membership is reconciled on each sync; malformed or incomplete
+sync fetches the selected run directly and pages cases and results at 100
+records per request. Results use Qase's `run` filter. Run membership is
+reconciled on each sync; malformed or incomplete
 pages fail the job with a visible error code instead of producing partial
 counts. The worker upserts by source identity, so retries do not duplicate
-records. It performs a full source reconciliation on every sync until the
-tenant's Qase result timestamp timezone and Jira bug mapping are verified;
-watermarks are stored for the later incremental path. Qase's 100,000 offset
+records. Workflow rows are cumulative selected-run state on days containing
+Qase activity; `total` is the run membership. Workload daily rows are grouped
+from stored Qase results. When no member display name has been synced, the
+stable member ID is returned as `name`; no placeholder person is created.
+Watermarks are stored for a
+later incremental path. Qase's 100,000 offset
 limit currently causes a safe job failure rather than silently dropping data.
+
+### Knowledge & RAG monitoring (Solr)
+
+Read-only view of the Solr vector DB (VPN only), under `/api/v1/knowledge`. Responses are plain JSON (no envelope).
+
+- `GET /knowledge/overview` - `{ram:{usedGb,totalGb,pct},lastFullSync,embedding:{model,dimension},collectionsActive,autoSyncEvery}`
+- `GET /knowledge/collections` - `[{name,docCount,target,coveragePct,status,lastSyncedAt,outdatedDocs,sizeBytes}]`; status `HEALTHY|OUTDATED_SYNC|NEEDS_REINDEX`
+- `GET /knowledge/documents?collection=&q=&page=&pageSize=` - `{items:[{id,title,key,sourceUrl,collection,chunks,dims,lastSyncedAt,syncStatus}],total,page,pageSize}`
+- `POST /knowledge/collections/:name/sync|reindex` (manager key) - forwards `{collection,mode}` to `SOLR_SYNC_WEBHOOK_URL`; 501 `SYNC_NOT_CONFIGURED` if unset, 202 on success, 502 on failure
+
+Env: `SOLR_BASE_URL`, `SOLR_USER`/`SOLR_PASSWORD`, `SOLR_TIMEOUT` (10s), `SOLR_VECTOR_COLLECTION`, `SOLR_COLLECTION_PREFIX` (`tc_`), `SOLR_EMBEDDING_MODEL`, `SOLR_VECTOR_DIMENSION` (fallback), `SOLR_COLLECTION_TARGETS` (`tc_apo=1200,...`, optional), `SOLR_SYNC_STALE_AFTER` (`14d`), `SOLR_AUTO_SYNC_EVERY`, `SOLR_SYNC_WEBHOOK_URL`.
 
 ## Tech Stack
 

@@ -6,3 +6,10 @@ tmp/
 *.csv
 .idea
 .DS_Store
+
+# local data snapshots (contain real data)
+migrations/data/
+
+# not published to GitHub
+infra/
+Jenkinsfile

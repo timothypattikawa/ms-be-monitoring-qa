@@ -25,7 +25,7 @@ type Project struct {
 	Health          string  `json:"health"`
 	QAOwner         string  `json:"qaOwner"`
 	QaseProjectCode string  `gorm:"index" json:"qaseProjectCode"`
-	ProjectSize        string `json:"projectSize"`
+	ProjectSize        *string `json:"projectSize"`
 	StagingMtttMinutes *int   `json:"stagingMtttMinutes"`
 	BetaMtttMinutes    *int   `json:"betaMtttMinutes"`
 	// QaseTotalCases/QaseTotalSuites come straight from Qase's own project
@@ -84,13 +84,16 @@ type JiraIssue struct {
 	SourceUpdatedAt *time.Time `json:"updatedAt"`
 	FetchedAt       time.Time  `json:"-"`
 }
-type ProjectQAAssignment struct {
-	ProjectID    string    `gorm:"primaryKey" json:"projectId"`
-	JiraAccountID string   `gorm:"primaryKey" json:"jiraAccountId"`
-	MemberID     *string   `gorm:"index" json:"memberId,omitempty"`
-	DisplayName  string    `json:"displayName"`
-	Active       bool      `gorm:"not null;index" json:"active"`
-	SyncedAt     time.Time `json:"syncedAt"`
+// JiraInitQA is one (INIT issue, QA) pair from Jira's QAs field. It covers
+// every INIT with a QA in any status — not just projects registered on the
+// dashboard — and is replaced wholesale on each QA-portfolio sync.
+type JiraInitQA struct {
+	InitKey       string    `gorm:"primaryKey" json:"initKey"`
+	JiraAccountID string    `gorm:"primaryKey" json:"jiraAccountId"`
+	DisplayName   string    `json:"displayName"`
+	InitName      string    `json:"initName"`
+	InitStatus    string    `json:"initStatus"`
+	SyncedAt      time.Time `json:"syncedAt"`
 }
 type QaseCase struct {
 	ID                string `gorm:"primaryKey"`
@@ -286,13 +289,23 @@ type WorkloadMember struct {
 	DailyExecutions []ExecutionDay `json:"dailyExecutions"`
 	ActiveProjects  int64          `json:"activeProjects"`
 	TotalProjects   int64          `json:"totalProjects"`
-	NextProject     *WorkloadProject `json:"nextProject"`
-	Projects        []WorkloadProject `json:"projects"`
+	// QaseMapped is false until the QA lead sets the member's Qase display
+	// name; until then the card shows Jira data only.
+	QaseMapped bool `json:"qaseMapped"`
+	// QaseName is the display name Qase records this QA's runs under (run
+	// testers are matched against it, not Name).
+	QaseName string `json:"qaseName"`
+	// QaseProjects are the dashboard-registered projects this QA executed in
+	// during the window — the Qase-side counterpart of Projects (Jira).
+	QaseProjects []WorkloadProject `json:"qaseProjects"`
+	NextProject *WorkloadProject  `json:"nextProject"`
+	Projects    []WorkloadProject `json:"projects"`
 }
 type WorkloadProject struct {
 	ID             string     `json:"id"`
 	Key            string     `json:"key"`
 	Name           string     `json:"name"`
+	Status         string     `json:"status"`
 	StagingStartAt *time.Time `json:"stagingStartAt"`
 }
 type JobDetails struct {
@@ -302,7 +315,7 @@ type JobDetails struct {
 }
 
 func Models() []any {
-	return []any{&Project{}, &Member{}, &Allocation{}, &JiraIssue{}, &ProjectQAAssignment{}, &QaseCase{}, &QaseRun{}, &QaseRunCase{}, &QaseResult{}, &QaseDefect{}, &SyncJob{}, &SyncStep{}, &SyncEvent{}, &SyncCursor{}}
+	return []any{&Project{}, &Member{}, &Allocation{}, &JiraIssue{}, &JiraInitQA{}, &QaseCase{}, &QaseRun{}, &QaseRunCase{}, &QaseResult{}, &QaseDefect{}, &SyncJob{}, &SyncStep{}, &SyncEvent{}, &SyncCursor{}}
 }
 
 type Monitoring struct{ db *gorm.DB }
@@ -439,34 +452,45 @@ func (r *Monitoring) ReplaceProjectBugs(projectID, scope string, bugs []JiraIssu
 	})
 }
 
-func (r *Monitoring) ReplaceProjectAssignments(projectID string, assignments []ProjectQAAssignment, syncedAt time.Time) error {
+// ReplaceJiraInitQAs swaps the whole QA-portfolio snapshot in one
+// transaction, so an INIT a QA was removed from (or that left Jira's result)
+// disappears from their portfolio.
+func (r *Monitoring) ReplaceJiraInitQAs(rows []JiraInitQA) error {
 	return r.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&ProjectQAAssignment{}).Where("project_id = ?", projectID).Update("active", false).Error; err != nil {
+		if err := tx.Where("1 = 1").Delete(&JiraInitQA{}).Error; err != nil {
 			return err
 		}
-		for i := range assignments {
-			assignments[i].ProjectID, assignments[i].Active, assignments[i].SyncedAt = projectID, true, syncedAt
-			var member Member
-			if err := tx.Where("jira_account_id = ?", assignments[i].JiraAccountID).First(&member).Error; err == nil {
-				assignments[i].MemberID = &member.ID
-			}
-			if err := tx.Clauses(clause.OnConflict{
-				Columns: []clause.Column{{Name: "project_id"}, {Name: "jira_account_id"}},
-				DoUpdates: clause.AssignmentColumns([]string{"member_id", "display_name", "active", "synced_at"}),
-			}).Create(&assignments[i]).Error; err != nil {
-				return err
-			}
+		if len(rows) == 0 {
+			return nil
 		}
-		return nil
+		return tx.CreateInBatches(&rows, 200).Error
 	})
 }
 
-func (r *Monitoring) MarkAssignmentsInactiveExcept(projectIDs []string) error {
-	q := r.db.Model(&ProjectQAAssignment{})
-	if len(projectIDs) > 0 {
-		q = q.Where("project_id NOT IN ?", projectIDs)
+// EnsureJiraMembers creates a QA member for every Jira QA that has none yet
+// (matched by Jira accountId). New members start active with an empty Qase
+// display name — the QA lead maps that later in the QA members page — and
+// existing members are left untouched. It returns how many were created.
+func (r *Monitoring) EnsureJiraMembers(users []Member) (int, error) {
+	created := 0
+	for _, u := range users {
+		if u.JiraAccountID == "" {
+			continue
+		}
+		var n int64
+		if err := r.db.Model(&Member{}).Where("jira_account_id = ?", u.JiraAccountID).Count(&n).Error; err != nil {
+			return created, err
+		}
+		if n > 0 {
+			continue
+		}
+		u.ID, u.Active = uuid.NewString(), true
+		if err := r.db.Create(&u).Error; err != nil {
+			return created, err
+		}
+		created++
 	}
-	return q.Update("active", false).Error
+	return created, nil
 }
 func (r *Monitoring) ProjectByJiraID(id string) (Project, bool, error) {
 	var v Project
@@ -1221,10 +1245,10 @@ func (r *Monitoring) ProjectTesterBreakdown(p Project) ([]TesterProgress, error)
 	return out, nil
 }
 func (r *Monitoring) SaveProjectMapping(jiraKey, name, code string, qaOwner string, stagingStart, stagingEnd, betaStart, betaEnd time.Time) (Project, error) {
-	return r.SaveProjectMappingWithMetadata(jiraKey, name, code, qaOwner, "", nil, nil, stagingStart, stagingEnd, betaStart, betaEnd)
+	return r.SaveProjectMappingWithMetadata(jiraKey, name, code, qaOwner, nil, nil, nil, stagingStart, stagingEnd, betaStart, betaEnd)
 }
 
-func (r *Monitoring) SaveProjectMappingWithMetadata(jiraKey, name, code, qaOwner, projectSize string, stagingMttt, betaMttt *int, stagingStart, stagingEnd, betaStart, betaEnd time.Time) (Project, error) {
+func (r *Monitoring) SaveProjectMappingWithMetadata(jiraKey, name, code, qaOwner string, projectSize *string, stagingMttt, betaMttt *int, stagingStart, stagingEnd, betaStart, betaEnd time.Time) (Project, error) {
 	var p Project
 	err := r.db.Transaction(func(tx *gorm.DB) error {
 		// ponytail: check-then-insert race on duplicate jiraInitKey/qaseProjectCode is possible under concurrent requests; acceptable given this is a manager-only, low-volume endpoint — add a DB-level advisory lock if concurrent creates become a real issue
@@ -1303,7 +1327,7 @@ var workloadQaseCountQuery = `
 SELECT count(*) FROM qase_results
 JOIN qase_cases qc ON qc.project_code = qase_results.project_code AND qc.case_id = qase_results.case_id
 JOIN qase_runs qr2 ON qr2.project_code = qase_results.project_code AND qr2.run_id = qase_results.run_id
-WHERE ` + testerColumnCaseSQL("qc", "qr2") + ` = ? AND qase_results.ended_at >= ? AND qase_results.ended_at < ?`
+WHERE ` + testerColumnCaseSQL("qc", "qr2") + ` = ? AND qase_results.ended_at >= ? AND qase_results.ended_at < ? AND qase_results.project_code IN (SELECT qase_project_code FROM projects WHERE qase_project_code <> '')`
 
 var workloadQaseDailyQuery = `
 SELECT to_char(qase_results.ended_at, 'YYYY-MM-DD') as date,
@@ -1314,8 +1338,19 @@ SELECT to_char(qase_results.ended_at, 'YYYY-MM-DD') as date,
 FROM qase_results
 JOIN qase_cases qc ON qc.project_code = qase_results.project_code AND qc.case_id = qase_results.case_id
 JOIN qase_runs qr2 ON qr2.project_code = qase_results.project_code AND qr2.run_id = qase_results.run_id
-WHERE ` + testerColumnCaseSQL("qc", "qr2") + ` = ? AND qase_results.ended_at >= ? AND qase_results.ended_at < ?
+WHERE ` + testerColumnCaseSQL("qc", "qr2") + ` = ? AND qase_results.ended_at >= ? AND qase_results.ended_at < ? AND qase_results.project_code IN (SELECT qase_project_code FROM projects WHERE qase_project_code <> '')
 GROUP BY date ORDER BY date`
+
+// workloadQaseProjectsQuery lists the dashboard-registered projects a QA has
+// recorded Qase results in during the window.
+var workloadQaseProjectsQuery = `
+SELECT DISTINCT p.id AS id, coalesce(nullif(p.jira_init_key,''), p.qase_project_code) AS key, p.name AS name
+FROM qase_results
+JOIN qase_cases qc ON qc.project_code = qase_results.project_code AND qc.case_id = qase_results.case_id
+JOIN qase_runs qr2 ON qr2.project_code = qase_results.project_code AND qr2.run_id = qase_results.run_id
+JOIN projects p ON p.qase_project_code = qase_results.project_code AND p.qase_project_code <> ''
+WHERE ` + testerColumnCaseSQL("qc", "qr2") + ` = ? AND qase_results.ended_at >= ? AND qase_results.ended_at < ?
+ORDER BY key`
 
 // distinctSyncedTesterNamesQuery lists every name that has actually appeared
 // as a tester on synced Qase cases, across every project — the roster of
@@ -1337,6 +1372,7 @@ SELECT name FROM (
 // synced Qase data with no matching qa_members row (no capacity concept).
 type workloadRoster struct {
 	id, name, qaseDisplayName string
+	jiraAccountID             string
 	weeklyCapacityHours       float64
 	registered                bool
 }
@@ -1357,10 +1393,15 @@ func (r *Monitoring) Workload(from, to time.Time, memberID string) ([]WorkloadMe
 		if memberID != "" && m.ID != memberID {
 			continue
 		}
-		roster = append(roster, workloadRoster{id: m.ID, name: memberDisplayName(m), qaseDisplayName: m.QaseDisplayName, weeklyCapacityHours: m.WeeklyCapacityHours, registered: true})
+		// An inactive member's Qase name stays reserved so it doesn't resurface
+		// below as a bare, unregistered Qase tester — inactive means hidden.
 		if m.QaseDisplayName != "" {
 			registeredQaseNames[m.QaseDisplayName] = true
 		}
+		if !m.Active {
+			continue
+		}
+		roster = append(roster, workloadRoster{id: m.ID, name: memberDisplayName(m), qaseDisplayName: m.QaseDisplayName, weeklyCapacityHours: m.WeeklyCapacityHours, jiraAccountID: m.JiraAccountID, registered: true})
 	}
 	if memberID == "" {
 		var names []string
@@ -1377,15 +1418,15 @@ func (r *Monitoring) Workload(from, to time.Time, memberID string) ([]WorkloadMe
 	}
 	out := make([]WorkloadMember, 0, len(roster))
 	for _, m := range roster {
-		v := WorkloadMember{ID: m.id, Name: m.name, DailyExecutions: []ExecutionDay{}}
+		v := WorkloadMember{ID: m.id, Name: m.name, DailyExecutions: []ExecutionDay{}, QaseProjects: []WorkloadProject{}, QaseName: m.qaseDisplayName, QaseMapped: strings.TrimSpace(m.qaseDisplayName) != ""}
 		if m.registered {
 			if err := r.db.Model(&Allocation{}).Select("coalesce(sum(planned_hours),0)").Where("member_id = ? AND week_start >= ? AND week_start < ?", m.id, from, to).Scan(&v.PlannedHours).Error; err != nil {
 				return nil, err
 			}
 			v.CapacityHours = float64(to.Sub(from).Hours()/168) * m.weeklyCapacityHours
-			if err := r.populateWorkloadProjects(m.id, &v); err != nil {
-				return nil, err
-			}
+		}
+		if err := r.populateWorkloadProjects(m.jiraAccountID, &v); err != nil {
+			return nil, err
 		}
 		if m.qaseDisplayName != "" {
 			if err := r.db.Raw(workloadQaseCountQuery, m.qaseDisplayName, from, to).Scan(&v.QaseExecutions).Error; err != nil {
@@ -1394,44 +1435,58 @@ func (r *Monitoring) Workload(from, to time.Time, memberID string) ([]WorkloadMe
 			if err := r.db.Raw(workloadQaseDailyQuery, m.qaseDisplayName, from, to).Scan(&v.DailyExecutions).Error; err != nil {
 				return nil, err
 			}
+			if err := r.db.Raw(workloadQaseProjectsQuery, m.qaseDisplayName, from, to).Scan(&v.QaseProjects).Error; err != nil {
+				return nil, err
+			}
 		}
 		out = append(out, v)
 	}
 	return out, nil
 }
 
-// excludedProjectStatuses mirrors plan §10.1's JQL status exclusion list —
-// no separate "active project" convention exists elsewhere in this file, so
-// the QA-portfolio sync's own JQL filter is reused here for consistency.
+// excludedProjectStatuses are the Jira statuses that mean an INIT is no longer
+// active (same list as the product's own QA-portfolio query).
 var excludedProjectStatuses = []string{"Cancel", "Done", "Postponed", "Backlog"}
 
-// populateWorkloadProjects fills a registered member's project-portfolio
-// fields (plan §10.3): TotalProjects counts every assignment ever synced for
-// them, regardless of active state; ActiveProjects/Projects/NextProject only
-// consider currently-active assignments on projects not in an excluded
-// status.
-func (r *Monitoring) populateWorkloadProjects(memberID string, v *WorkloadMember) error {
-	if err := r.db.Model(&ProjectQAAssignment{}).Where("member_id = ?", memberID).Count(&v.TotalProjects).Error; err != nil {
+func isActiveInitStatus(status string) bool {
+	for _, s := range excludedProjectStatuses {
+		if strings.EqualFold(strings.TrimSpace(status), s) {
+			return false
+		}
+	}
+	return true
+}
+
+// populateWorkloadProjects fills a QA's project portfolio straight from the
+// Jira snapshot (jira_init_qas), matched by Jira accountId: TotalProjects is
+// every INIT they are a QA on, and Projects/ActiveProjects only those whose
+// Jira status isn't excluded. The INIT need not be registered on the
+// dashboard. NextProject is the nearest upcoming staging start among the
+// active INITs that are registered projects.
+func (r *Monitoring) populateWorkloadProjects(jiraAccountID string, v *WorkloadMember) error {
+	v.Projects = []WorkloadProject{}
+	if jiraAccountID == "" {
+		return nil
+	}
+	var rows []JiraInitQA
+	if err := r.db.Where("jira_account_id = ?", jiraAccountID).Order("length(init_key) desc, init_key desc").Find(&rows).Error; err != nil {
 		return err
 	}
-	var active []Project
-	if err := r.db.Model(&Project{}).
-		Joins("JOIN project_qa_assignments ON project_qa_assignments.project_id = projects.id").
-		Where("project_qa_assignments.member_id = ? AND project_qa_assignments.active = ? AND projects.status NOT IN ?", memberID, true, excludedProjectStatuses).
-		Find(&active).Error; err != nil {
-		return err
+	v.TotalProjects = int64(len(rows))
+	activeKeys := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if !isActiveInitStatus(row.InitStatus) {
+			continue
+		}
+		v.Projects = append(v.Projects, WorkloadProject{ID: row.InitKey, Key: row.InitKey, Name: row.InitName, Status: row.InitStatus})
+		activeKeys = append(activeKeys, row.InitKey)
 	}
-	v.ActiveProjects = int64(len(active))
-	v.Projects = make([]WorkloadProject, 0, len(active))
-	for _, p := range active {
-		v.Projects = append(v.Projects, WorkloadProject{ID: p.ID, Key: p.JiraInitKey, Name: p.Name, StagingStartAt: p.StagingStartAt})
+	v.ActiveProjects = int64(len(v.Projects))
+	if len(activeKeys) == 0 {
+		return nil
 	}
 	var next Project
-	err := r.db.Model(&Project{}).
-		Joins("JOIN project_qa_assignments ON project_qa_assignments.project_id = projects.id").
-		Where("project_qa_assignments.member_id = ? AND project_qa_assignments.active = ? AND projects.staging_start_at >= ?", memberID, true, time.Now().UTC()).
-		Order("projects.staging_start_at asc").
-		Limit(1).First(&next).Error
+	err := r.db.Where("jira_init_key IN ? AND staging_start_at >= ?", activeKeys, time.Now().UTC()).Order("staging_start_at asc").First(&next).Error
 	if err == nil {
 		v.NextProject = &WorkloadProject{ID: next.ID, Key: next.JiraInitKey, Name: next.Name, StagingStartAt: next.StagingStartAt}
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -1478,15 +1533,18 @@ func (r *Monitoring) ProjectBugSummary(p Project) (ProjectBugSummary, error) {
 	}
 	if len(jiraBugs) > 0 {
 		for _, bug := range jiraBugs {
+			// Canceled/Invalid bugs are noise: counted only in Canceled, never
+			// in Total/Staging/Beta or the Beta>30% check.
+			if strings.EqualFold(strings.TrimSpace(bug.Status), "Invalid") || strings.Contains(strings.ToLower(bug.Status), "cancel") {
+				out.Canceled++
+				continue
+			}
 			out.Total++
 			switch strings.ToUpper(strings.TrimSpace(bug.Environment)) {
 			case "STAGING":
 				out.Staging++
 			case "BETA":
 				out.Beta++
-			}
-			if strings.EqualFold(strings.TrimSpace(bug.Status), "Invalid") || strings.Contains(strings.ToLower(bug.Status), "cancel") {
-				out.Canceled++
 			}
 		}
 		out.BetaOverThirtyPercentOfStaging = out.Beta*100 > out.Staging*30
@@ -1497,19 +1555,20 @@ func (r *Monitoring) ProjectBugSummary(p Project) (ProjectBugSummary, error) {
 		return out, err
 	}
 	for _, defect := range defects {
-		out.Total++
-		switch strings.ToUpper(strings.TrimSpace(defect.Environment)) {
-		case "STAGING":
-			out.Staging++
-		case "BETA":
-			out.Beta++
-		}
 		status := defect.JiraStatus
 		if status == "" {
 			status = defect.Status
 		}
 		if strings.Contains(strings.ToLower(status), "cancel") {
 			out.Canceled++
+			continue
+		}
+		out.Total++
+		switch strings.ToUpper(strings.TrimSpace(defect.Environment)) {
+		case "STAGING":
+			out.Staging++
+		case "BETA":
+			out.Beta++
 		}
 	}
 	out.BetaOverThirtyPercentOfStaging = out.Beta*100 > out.Staging*30
@@ -1567,7 +1626,7 @@ func (r *Monitoring) ProductionBugs(page, pageSize int) (ProductionBugPage, erro
 	if err := q.Count(&out.Total).Error; err != nil {
 		return out, err
 	}
-	if err := q.Select("id, key, project_id, summary, severity, status, creator, reporter, assignee, source_updated_at AS updated_at").
+	if err := q.Select("id, key, project_id, summary, severity, status, creator, reporter, assignee, created_at, source_updated_at AS updated_at").
 		Order("fetched_at asc").Offset((page - 1) * pageSize).Limit(pageSize).Scan(&out.Items).Error; err != nil {
 		return out, err
 	}

@@ -20,10 +20,9 @@ func TestMonitoringModelInventory(t *testing.T) {
 		if typ.Kind() != reflect.Pointer || seen[typ] {
 			t.Fatalf("model inventory contains invalid or duplicate type %v", typ)
 		}
-		// ProjectQAAssignment is a junction table with a composite primary
-		// key (project_id, jira_account_id) per the plan, so it has no
-		// singular ID field.
-		if typ == reflect.TypeOf(&ProjectQAAssignment{}) {
+		// JiraInitQA is a junction table with a composite primary key
+		// (init_key, jira_account_id), so it has no singular ID field.
+		if typ == reflect.TypeOf(&JiraInitQA{}) {
 			seen[typ] = true
 			continue
 		}
@@ -145,6 +144,9 @@ func TestWorkloadQaseQueriesMatchTesterNameByPlatform(t *testing.T) {
 	if _, err := repo.UpsertCase(&QaseCase{ID: "c3", ProjectCode: "P", CaseID: 3, TesterName: "Alice"}); err != nil {
 		t.Fatal(err)
 	}
+	if err := repo.db.Create(&Project{ID: "p1", JiraInitKey: "INIT-1", Name: "Proj", QaseProjectCode: "P"}).Error; err != nil {
+		t.Fatal(err)
+	}
 	if _, err := repo.UpsertRun(&QaseRun{ID: "r10", ProjectCode: "P", RunID: 10, Platform: "IOS"}); err != nil {
 		t.Fatal(err)
 	}
@@ -173,6 +175,14 @@ func TestWorkloadQaseQueriesMatchTesterNameByPlatform(t *testing.T) {
 	}
 	if count != 3 {
 		t.Fatalf("got %d matching qase results, want 3 (only same-platform tester matches)", count)
+	}
+
+	var projects []WorkloadProject
+	if err := repo.db.Raw(workloadQaseProjectsQuery, "Alice", from, to).Scan(&projects).Error; err != nil {
+		t.Fatalf("projects query: %v", err)
+	}
+	if len(projects) != 1 || projects[0].Key != "INIT-1" {
+		t.Fatalf("got %+v, want only the registered project INIT-1", projects)
 	}
 
 	var none int64
@@ -631,7 +641,8 @@ func TestProjectBugSummaryCountsBothEnvironmentsAndCanceled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Staging != 2 || got.Beta != 1 || got.Total != 4 || got.Canceled != 1 || !got.BetaOverThirtyPercentOfStaging {
+	// The canceled d2 is counted only in Canceled, not in Staging or Total.
+	if got.Staging != 1 || got.Beta != 1 || got.Total != 3 || got.Canceled != 1 || !got.BetaOverThirtyPercentOfStaging {
 		t.Fatalf("unexpected summary: %+v", got)
 	}
 }
@@ -661,53 +672,32 @@ func TestProductionBugsPaginatesInPersistedJQLOrder(t *testing.T) {
 	}
 }
 
-// TestWorkloadPopulatesProjectPortfolioFields covers plan §10.3: ActiveProjects
-// only counts active assignments on non-excluded-status projects, TotalProjects
-// counts every assignment ever synced regardless of active/status, NextProject
-// picks the nearest future staging start among active assignments, and Projects
-// lists all of them.
-func TestWorkloadPopulatesProjectPortfolioFields(t *testing.T) {
+// TestWorkloadPopulatesProjectPortfolioFromJira: the portfolio comes straight
+// from the Jira snapshot by accountId. TotalProjects counts every INIT the QA
+// is on (registered on the dashboard or not), ActiveProjects/Projects only
+// those whose Jira status isn't Cancel/Done/Postponed/Backlog, and NextProject
+// is the nearest upcoming staging start among active INITs that are registered.
+func TestWorkloadPopulatesProjectPortfolioFromJira(t *testing.T) {
 	repo := NewSQLiteForTest(t)
 	now := time.Now().UTC()
-
-	projA, err := repo.SaveProjectMapping("INIT-1", "Checkout", "CHK", "Kiki", now.Add(48*time.Hour), now, now, now)
-	if err != nil {
+	if _, err := repo.SaveProjectMapping("INIT-1", "Checkout", "CHK", "Kiki", now.Add(48*time.Hour), now, now, now); err != nil {
 		t.Fatal(err)
 	}
-	projB, err := repo.SaveProjectMapping("INIT-2", "Legacy Cleanup", "LEG", "Kiki", now, now, now, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	projB.Status = "Done"
-	if err := repo.SaveProject(&projB); err != nil {
-		t.Fatal(err)
-	}
-	projC, err := repo.SaveProjectMapping("INIT-3", "Old Project", "OLD", "Kiki", now, now, now, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	projD, err := repo.SaveProjectMapping("INIT-4", "Refund Flow", "RFD", "Kiki", now.Add(24*time.Hour), now, now, now)
-	if err != nil {
+	if _, err := repo.SaveProjectMapping("INIT-4", "Refund Flow", "RFD", "Kiki", now.Add(24*time.Hour), now, now, now); err != nil {
 		t.Fatal(err)
 	}
 	if err := repo.SaveMember(&Member{ID: "m1", Name: "Nadia", JiraAccountID: "acc1", Active: true}); err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range []Project{projA, projD} {
-		if err := repo.ReplaceProjectAssignments(p.ID, []ProjectQAAssignment{{JiraAccountID: "acc1", DisplayName: "Nadia"}}, now); err != nil {
-			t.Fatal(err)
-		}
+	rows := []JiraInitQA{
+		{InitKey: "INIT-1", JiraAccountID: "acc1", InitName: "Checkout", InitStatus: "In Development"},
+		{InitKey: "INIT-4", JiraAccountID: "acc1", InitName: "Refund Flow", InitStatus: "QA"},
+		{InitKey: "INIT-2", JiraAccountID: "acc1", InitName: "Legacy Cleanup", InitStatus: "Done"},
+		{InitKey: "INIT-3", JiraAccountID: "acc1", InitName: "Old Project", InitStatus: "Cancel"},
+		{InitKey: "INIT-900", JiraAccountID: "acc1", InitName: "Not registered on dashboard", InitStatus: "TO"},
+		{InitKey: "INIT-1", JiraAccountID: "acc-other", InitName: "Checkout", InitStatus: "In Development"},
 	}
-	if err := repo.ReplaceProjectAssignments(projB.ID, []ProjectQAAssignment{{JiraAccountID: "acc1", DisplayName: "Nadia"}}, now); err != nil {
-		t.Fatal(err)
-	}
-	// projC's assignment existed once but was dropped on a later sync (no
-	// longer in Jira's QAs field) — it must still count toward TotalProjects
-	// but not ActiveProjects.
-	if err := repo.ReplaceProjectAssignments(projC.ID, []ProjectQAAssignment{{JiraAccountID: "acc1", DisplayName: "Nadia"}}, now); err != nil {
-		t.Fatal(err)
-	}
-	if err := repo.ReplaceProjectAssignments(projC.ID, nil, now.Add(time.Minute)); err != nil {
+	if err := repo.ReplaceJiraInitQAs(rows); err != nil {
 		t.Fatal(err)
 	}
 
@@ -719,23 +709,99 @@ func TestWorkloadPopulatesProjectPortfolioFields(t *testing.T) {
 		t.Fatalf("got %d workload members, want 1", len(members))
 	}
 	got := members[0]
-	if got.TotalProjects != 4 {
-		t.Fatalf("TotalProjects = %d, want 4 (every assignment ever synced)", got.TotalProjects)
+	if got.TotalProjects != 5 {
+		t.Fatalf("TotalProjects = %d, want 5 (every INIT of this QA, incl. Done/Cancel/unregistered)", got.TotalProjects)
 	}
-	if got.ActiveProjects != 2 {
-		t.Fatalf("ActiveProjects = %d, want 2 (excludes Done status and dropped assignment)", got.ActiveProjects)
+	if got.ActiveProjects != 3 || len(got.Projects) != 3 {
+		t.Fatalf("ActiveProjects = %d, Projects = %+v, want 3 (INIT-1, INIT-4, INIT-900)", got.ActiveProjects, got.Projects)
 	}
-	if len(got.Projects) != 2 {
-		t.Fatalf("Projects = %+v, want 2 entries", got.Projects)
-	}
-	gotKeys := map[string]bool{}
-	for _, p := range got.Projects {
-		gotKeys[p.Key] = true
-	}
-	if !gotKeys["INIT-1"] || !gotKeys["INIT-4"] {
-		t.Fatalf("Projects keys = %v, want INIT-1 and INIT-4", gotKeys)
+	if got.Projects[0].Key != "INIT-900" || got.Projects[0].Status != "TO" {
+		t.Fatalf("Projects[0] = %+v, want the newest INIT-900 with its Jira status", got.Projects[0])
 	}
 	if got.NextProject == nil || got.NextProject.Key != "INIT-4" {
 		t.Fatalf("NextProject = %+v, want the nearer-future INIT-4", got.NextProject)
+	}
+	if got.QaseMapped {
+		t.Fatal("QaseMapped must be false while the member has no Qase display name")
+	}
+
+	// A later snapshot replaces the previous one wholesale.
+	if err := repo.ReplaceJiraInitQAs([]JiraInitQA{{InitKey: "INIT-1", JiraAccountID: "acc1", InitStatus: "QA"}}); err != nil {
+		t.Fatal(err)
+	}
+	members, err = repo.Workload(now.Add(-24*time.Hour), now.Add(24*time.Hour), "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if members[0].TotalProjects != 1 {
+		t.Fatalf("TotalProjects after replace = %d, want 1", members[0].TotalProjects)
+	}
+}
+
+// TestWorkloadHidesInactiveMembers: an inactive QA member disappears from the
+// workload (portfolio cards and charts), and its Qase name doesn't come back
+// as a bare Qase tester either.
+func TestWorkloadHidesInactiveMembers(t *testing.T) {
+	repo := NewSQLiteForTest(t)
+	now := time.Now().UTC()
+	if err := repo.SaveMember(&Member{ID: "m1", Name: "Budi", JiraAccountID: "acc-budi", Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SaveMember(&Member{ID: "m2", Name: "Ugi", JiraAccountID: "acc-ugi", Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	m2, err := repo.Member("m2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2.Active = false
+	if err := repo.SaveMember(&m2); err != nil {
+		t.Fatal(err)
+	}
+	members, err := repo.Workload(now.Add(-24*time.Hour), now.Add(24*time.Hour), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(members) != 1 || members[0].Name != "Budi" {
+		t.Fatalf("expected only the active member Budi, got %+v", members)
+	}
+}
+
+func TestEnsureJiraMembersCreatesOnlyMissingActiveUnmappedMembers(t *testing.T) {
+	repo := NewSQLiteForTest(t)
+	if err := repo.SaveMember(&Member{ID: "m1", Name: "Kiki Melati Manurung", JiraAccountID: "acc-kiki", QaseDisplayName: "Kiki", Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	created, err := repo.EnsureJiraMembers([]Member{
+		{Name: "Kiki Manurung", JiraAccountID: "acc-kiki"},
+		{Name: "Budi Haryanto", JiraAccountID: "acc-budi", JiraEmail: "budi@example.com"},
+		{Name: "No Account"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created != 1 {
+		t.Fatalf("created = %d, want 1 (only Budi: Kiki exists, no-account is skipped)", created)
+	}
+	members, err := repo.Members(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(members) != 2 {
+		t.Fatalf("members = %+v, want 2", members)
+	}
+	for _, m := range members {
+		switch m.JiraAccountID {
+		case "acc-kiki":
+			if m.Name != "Kiki Melati Manurung" || m.QaseDisplayName != "Kiki" {
+				t.Fatalf("existing member must stay untouched, got %+v", m)
+			}
+		case "acc-budi":
+			if !m.Active || m.QaseDisplayName != "" || m.JiraEmail != "budi@example.com" || m.ID == "" {
+				t.Fatalf("new member must be active with an empty Qase display name, got %+v", m)
+			}
+		default:
+			t.Fatalf("unexpected member %+v", m)
+		}
 	}
 }

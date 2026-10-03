@@ -130,27 +130,30 @@ func (x Connector) JiraPages(ctx context.Context, jql string, visit func(jiraIss
 	return errors.New("JIRA_PAGE_LIMIT")
 }
 
-// qaPortfolioJQL is plan §10.1's exact JQL for the QA-assigned active
-// project portfolio. The QAs field's JSON key isn't known statically (it's
-// workspace-specific), so it's injected via JIRA_QAS_FIELD_ID.
-const qaPortfolioJQL = `project = INIT AND status NOT IN (Cancel, Done, Postponed, Backlog) AND "QAs[User Picker (multiple users)]" IS NOT EMPTY ORDER BY created DESC`
+// qaPortfolioJQL lists every INIT issue that has a QA assigned, in any status:
+// the QA portfolio is derived from it (Total = all of a QA's INITs, Active =
+// those whose Jira status isn't Cancel/Done/Postponed/Backlog). The QAs
+// field's JSON key isn't known statically (it's workspace-specific), so it's
+// injected via JIRA_QAS_FIELD_ID.
+const qaPortfolioJQL = `project = INIT AND "QAs[User Picker (multiple users)]" IS NOT EMPTY ORDER BY created DESC`
 
 type jiraQAUser struct {
-	AccountID   string `json:"accountId"`
-	DisplayName string `json:"displayName"`
+	AccountID    string `json:"accountId"`
+	DisplayName  string `json:"displayName"`
+	EmailAddress string `json:"emailAddress"`
 }
 
 type jiraIssueWithQAs struct {
-	Key string
-	QAs []jiraQAUser
+	Key     string
+	Summary string
+	Status  string
+	QAs     []jiraQAUser
 }
 
-// JiraActiveInitsWithQAs lists active INIT issues that have a QA assigned,
-// via plan §10.1's JQL, and hands back each issue's key plus its QAs custom
-// field. ponytail: the real QAs field ID isn't known yet, so this reads it
-// from JIRA_QAS_FIELD_ID at call time and no-ops cleanly until ops set it —
-// activates once JIRA_QAS_FIELD_ID is configured.
-func (x Connector) JiraActiveInitsWithQAs(ctx context.Context, visit func(jiraIssueWithQAs) error) error {
+// JiraInitsWithQAs lists every INIT issue that has a QA assigned and hands
+// back its key, summary, Jira status and QAs custom field. It reads the field
+// ID from JIRA_QAS_FIELD_ID at call time and no-ops cleanly while it's unset.
+func (x Connector) JiraInitsWithQAs(ctx context.Context, visit func(jiraIssueWithQAs) error) error {
 	fieldID := os.Getenv("JIRA_QAS_FIELD_ID")
 	if fieldID == "" {
 		return nil
@@ -161,7 +164,7 @@ func (x Connector) JiraActiveInitsWithQAs(ctx context.Context, visit func(jiraIs
 	pageToken := ""
 	seen := map[string]bool{}
 	for page := 0; page < 10000; page++ {
-		body := map[string]any{"jql": qaPortfolioJQL, "fields": []string{"summary", fieldID}, "maxResults": 100}
+		body := map[string]any{"jql": qaPortfolioJQL, "fields": []string{"summary", "status", fieldID}, "maxResults": 100}
 		if pageToken != "" {
 			body["nextPageToken"] = pageToken
 		}
@@ -192,7 +195,13 @@ func (x Connector) JiraActiveInitsWithQAs(ctx context.Context, visit func(jiraIs
 			if b := issue.Fields[fieldID]; len(b) > 0 {
 				_ = json.Unmarshal(b, &qas)
 			}
-			if err := visit(jiraIssueWithQAs{Key: issue.Key, QAs: qas}); err != nil {
+			var summary string
+			_ = json.Unmarshal(issue.Fields["summary"], &summary)
+			var status struct {
+				Name string `json:"name"`
+			}
+			_ = json.Unmarshal(issue.Fields["status"], &status)
+			if err := visit(jiraIssueWithQAs{Key: issue.Key, Summary: summary, Status: status.Name, QAs: qas}); err != nil {
 				return err
 			}
 		}
