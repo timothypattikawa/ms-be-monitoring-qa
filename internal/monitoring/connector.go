@@ -265,6 +265,43 @@ func (x Connector) QaseProject(ctx context.Context, code string) (json.RawMessag
 	return env.Result, nil
 }
 
+// QaseProjectTitles lists every Qase project (paginated) as code -> title.
+func (x Connector) QaseProjectTitles(ctx context.Context) (map[string]string, error) {
+	if x.QaseToken == "" {
+		return nil, errors.New("QASE_CONFIG_MISSING")
+	}
+	out := map[string]string{}
+	for offset := 0; offset <= 100000; offset += 100 {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/v1/project?limit=100&offset=%d", x.QaseBaseURL, offset), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Token", x.QaseToken)
+		var env qaseEnvelope
+		if err := x.do(req, &env); err != nil {
+			return nil, err
+		}
+		var list struct {
+			Total    int `json:"total"`
+			Entities []struct {
+				Code  string `json:"code"`
+				Title string `json:"title"`
+			} `json:"entities"`
+		}
+		if !env.Status || json.Unmarshal(env.Result, &list) != nil {
+			return nil, errors.New("QASE_RESPONSE_INVALID")
+		}
+		for _, p := range list.Entities {
+			out[strings.TrimSpace(p.Code)] = strings.TrimSpace(p.Title)
+		}
+		if len(list.Entities) < 100 || (list.Total > 0 && offset+len(list.Entities) >= list.Total) {
+			return out, nil
+		}
+	}
+	return nil, errors.New("QASE_OFFSET_LIMIT")
+}
+
 type qaseEnvelope struct {
 	Status bool            `json:"status"`
 	Result json.RawMessage `json:"result"`

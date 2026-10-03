@@ -135,6 +135,7 @@ Read-only view of the Solr vector DB (VPN only), under `/api/v1/knowledge`. Resp
 
 - `GET /knowledge/overview` - `{ram:{usedGb,totalGb,pct},lastFullSync,embedding:{model,dimension},collectionsActive,autoSyncEvery}`
 - `GET /knowledge/collections` - `[{name,docCount,target,coveragePct,status,lastSyncedAt,outdatedDocs,sizeBytes}]`; status `HEALTHY|OUTDATED_SYNC|NEEDS_REINDEX`
+- `GET /knowledge/projects` - `{totals:{collections,docs,projects,emptyCollections},collections:[{name,label,docCount,projectCount,projects:[{code,name,docs}],error?}]}`; vector collection first, then `tc_*` by name; per-project docs from a Solr facet on `project`; names from Qase (cached 10 min), fallback to local projects table, else `""`; a failed facet gives `projects:[]` + `error:"facet_failed"`
 - `GET /knowledge/documents?collection=&q=&page=&pageSize=` - `{items:[{id,title,key,sourceUrl,collection,chunks,dims,lastSyncedAt,syncStatus}],total,page,pageSize}`
 - `POST /knowledge/collections/:name/sync|reindex` (manager key) - forwards `{collection,mode}` to `SOLR_SYNC_WEBHOOK_URL`; 501 `SYNC_NOT_CONFIGURED` if unset, 202 on success, 502 on failure
 

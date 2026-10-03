@@ -107,6 +107,21 @@ func (s Solr) get(ctx context.Context, path string, params url.Values, out any) 
 
 // Cores lists prefix-matching cores (dynamic), excluding the vector collection.
 func (s Solr) Cores(ctx context.Context) ([]solrCore, error) {
+	all, err := s.statusCores(ctx)
+	if err != nil {
+		return nil, err
+	}
+	cores := []solrCore{}
+	for _, c := range all {
+		if strings.HasPrefix(c.Name, s.Prefix) && c.Name != s.VectorCollection {
+			cores = append(cores, c)
+		}
+	}
+	return cores, nil
+}
+
+// statusCores returns every core from the cores STATUS call, sorted by name.
+func (s Solr) statusCores(ctx context.Context) ([]solrCore, error) {
 	var raw struct {
 		Status map[string]struct {
 			Index struct {
@@ -121,9 +136,6 @@ func (s Solr) Cores(ctx context.Context) ([]solrCore, error) {
 	}
 	cores := []solrCore{}
 	for name, st := range raw.Status {
-		if !strings.HasPrefix(name, s.Prefix) || name == s.VectorCollection {
-			continue
-		}
 		core := solrCore{Name: name, DocCount: st.Index.NumDocs, SizeBytes: st.Index.SizeInBytes}
 		if t, err := time.Parse(time.RFC3339, st.Index.LastModified); err == nil {
 			core.LastModified = &t

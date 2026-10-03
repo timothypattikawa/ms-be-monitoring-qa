@@ -12,6 +12,7 @@ import (
 func (a API) RegisterKnowledgeRoutes(group *echo.Group) {
 	group.GET("/knowledge/overview", a.knowledgeOverview)
 	group.GET("/knowledge/collections", a.knowledgeCollections)
+	group.GET("/knowledge/projects", a.knowledgeProjects)
 	group.GET("/knowledge/documents", a.knowledgeDocuments)
 	group.POST("/knowledge/collections/:name/sync", a.knowledgeTrigger("sync"), a.managerAuth)
 	group.POST("/knowledge/collections/:name/reindex", a.knowledgeTrigger("reindex"), a.managerAuth)
