@@ -174,6 +174,7 @@ func (a API) Register(e *echo.Echo) {
 	g.GET("/projects", a.projects)
 	g.GET("/projects/:id", a.project)
 	g.POST("/projects", a.createProject, a.managerAuth)
+	g.POST("/projects/:id/risk-email", a.sendRiskEmail, a.managerAuth)
 	g.GET("/qa-members", a.members)
 	g.GET("/qa-members/:id", a.member)
 	g.POST("/qa-members", a.createMember, a.managerAuth)
