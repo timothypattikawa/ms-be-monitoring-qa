@@ -28,6 +28,9 @@ type Project struct {
 	ProjectSize        *string `json:"projectSize"`
 	StagingMtttMinutes *int   `json:"stagingMtttMinutes"`
 	BetaMtttMinutes    *int   `json:"betaMtttMinutes"`
+	// TimelinePlanDays is the QA lead's manual plan (man days) compared
+	// against the auto-computed STG working days on the Bugs page widget.
+	TimelinePlanDays *float64 `json:"timelinePlanDays"`
 	// QaseTotalCases/QaseTotalSuites come straight from Qase's own project
 	// summary (GET /v1/project/{code}.counts) — the project's full scope,
 	// not derived by paginating every run's cases.
@@ -211,10 +214,15 @@ type SyncCursor struct {
 }
 
 type Counts struct {
-	Passed  int64 `json:"passed"`
-	Failed  int64 `json:"failed"`
-	Blocked int64 `json:"blocked"`
-	Total   int64 `json:"total"`
+	Passed     int64 `json:"passed"`
+	Failed     int64 `json:"failed"`
+	Blocked    int64 `json:"blocked"`
+	Skipped    int64 `json:"skipped"`
+	Retest     int64 `json:"retest"`
+	Invalid    int64 `json:"invalid"`
+	InProgress int64 `json:"inProgress"`
+	Cancelled  int64 `json:"cancelled"`
+	Total      int64 `json:"total"`
 }
 type EnvironmentStats struct {
 	Environment string `json:"environment"`
@@ -244,6 +252,11 @@ type ProjectRun struct {
 	Passed         int64      `json:"passed"`
 	Failed         int64      `json:"failed"`
 	Blocked        int64      `json:"blocked"`
+	Skipped        int64      `json:"skipped"`
+	Retest         int64      `json:"retest"`
+	Invalid        int64      `json:"invalid"`
+	InProgress     int64      `json:"inProgress"`
+	Cancelled      int64      `json:"cancelled"`
 	Total          int64      `json:"total"`
 	StartedAt      *time.Time `json:"startedAt"`
 	FinishedAt     *time.Time `json:"finishedAt"`
@@ -315,12 +328,17 @@ type JobDetails struct {
 }
 
 func Models() []any {
-	return []any{&Project{}, &Member{}, &Allocation{}, &JiraIssue{}, &JiraInitQA{}, &QaseCase{}, &QaseRun{}, &QaseRunCase{}, &QaseResult{}, &QaseDefect{}, &SyncJob{}, &SyncStep{}, &SyncEvent{}, &SyncCursor{}}
+	return []any{&Project{}, &Member{}, &Allocation{}, &JiraIssue{}, &JiraInitQA{}, &QaseCase{}, &QaseRun{}, &QaseRunCase{}, &QaseResult{}, &QaseDefect{}, &SyncJob{}, &SyncStep{}, &SyncEvent{}, &SyncCursor{}, &NationalHoliday{}}
 }
 
 type Monitoring struct{ db *gorm.DB }
 
-func (r *Monitoring) AutoMigrate() error { return r.db.AutoMigrate(Models()...) }
+func (r *Monitoring) AutoMigrate() error {
+	if err := r.db.AutoMigrate(Models()...); err != nil {
+		return err
+	}
+	return r.SeedNationalHolidays()
+}
 func (r *Monitoring) FailExhausted(now time.Time) error {
 	return r.db.Transaction(func(tx *gorm.DB) error {
 		var jobs []SyncJob
@@ -684,8 +702,7 @@ func (r *Monitoring) activeRuns(projectCode string) ([]QaseRun, error) {
 }
 
 // runCounts computes Counts for a single run (latest result per case, gated
-// on run-case membership) — the same logic ProjectCounts used to run once
-// for a project's single registered run, now called per active run.
+// on run-case membership) — used by ProjectRuns for the per-run breakdown.
 func (r *Monitoring) runCounts(projectCode string, runID int64) (Counts, int64, error) {
 	var out Counts
 	var membership int64
@@ -698,7 +715,21 @@ func (r *Monitoring) runCounts(projectCode string, runID int64) (Counts, int64, 
 	// ponytail: ROW_NUMBER()+NULLS LAST instead of Postgres' DISTINCT ON so this
 	// query also runs against the in-memory SQLite test DB (testing.go) — same
 	// "latest result per case" semantics, portable across both.
-	q := `SELECT count(*) FILTER (WHERE status='passed') AS passed,count(*) FILTER (WHERE status='failed') AS failed,count(*) FILTER (WHERE status='blocked') AS blocked FROM (SELECT r.status, ROW_NUMBER() OVER (PARTITION BY r.case_id ORDER BY r.ended_at DESC NULLS LAST,r.result_id DESC) AS rn FROM qase_results r JOIN qase_run_cases rc ON rc.project_code=r.project_code AND rc.run_id=r.run_id AND rc.case_id=r.case_id WHERE r.project_code=? AND r.run_id=?) latest WHERE rn=1`
+	q := `SELECT
+		count(*) FILTER (WHERE lower(trim(status))='passed') AS passed,
+		count(*) FILTER (WHERE lower(trim(status))='failed') AS failed,
+		count(*) FILTER (WHERE lower(trim(status))='blocked') AS blocked,
+		count(*) FILTER (WHERE lower(trim(status))='skipped') AS skipped,
+		count(*) FILTER (WHERE lower(trim(status))='retest') AS retest,
+		count(*) FILTER (WHERE lower(trim(status))='invalid') AS invalid,
+		count(*) FILTER (WHERE lower(trim(status)) IN ('in_progress','in progress')) AS in_progress,
+		count(*) FILTER (WHERE lower(trim(status)) IN ('cancel','cancelled','canceled')) AS cancelled
+	FROM (
+		SELECT r.status, ROW_NUMBER() OVER (PARTITION BY r.case_id ORDER BY r.ended_at DESC NULLS LAST,r.result_id DESC) AS rn
+		FROM qase_results r
+		JOIN qase_run_cases rc ON rc.project_code=r.project_code AND rc.run_id=r.run_id AND rc.case_id=r.case_id
+		WHERE r.project_code=? AND r.run_id=?
+	) latest WHERE rn=1`
 	if err := r.db.Raw(q, projectCode, runID).Scan(&out).Error; err != nil {
 		return Counts{}, 0, err
 	}
@@ -713,30 +744,69 @@ func (r *Monitoring) ProjectCounts(p Project) (Counts, bool, error) {
 	if err != nil {
 		return out, false, err
 	}
-	if len(runs) == 0 && p.QaseTotalCases == 0 {
-		return out, false, nil
-	}
-	found := false
+	var runIDs []int64
 	for _, run := range runs {
 		if DashboardEnvironment(run.Title) == "" {
 			continue
 		}
-		counts, membership, err := r.runCounts(p.QaseProjectCode, run.RunID)
-		if err != nil {
+		runIDs = append(runIDs, run.RunID)
+	}
+	found := false
+	if len(runIDs) > 0 {
+		var membership int64
+		if err := r.db.Raw("SELECT count(DISTINCT case_id) FROM qase_run_cases WHERE project_code = ? AND run_id IN ?",
+			p.QaseProjectCode, runIDs).Scan(&membership).Error; err != nil {
 			return Counts{}, false, err
 		}
-		if membership == 0 {
-			continue
+		if membership > 0 {
+			found = true
+			out.Total = membership
+			// Latest result per case across ALL active runs, not a per-run
+			// sum — the same scenario runs on STG and BETA (often several
+			// platforms), so summing runs counts it once per run and can
+			// push Passed past the unique-case Total. See
+			// ProjectEnvironmentCounts for the per-environment variant.
+			q := `SELECT
+				count(*) FILTER (WHERE lower(trim(status))='passed') AS passed,
+				count(*) FILTER (WHERE lower(trim(status))='failed') AS failed,
+				count(*) FILTER (WHERE lower(trim(status))='blocked') AS blocked,
+				count(*) FILTER (WHERE lower(trim(status))='skipped') AS skipped,
+				count(*) FILTER (WHERE lower(trim(status))='retest') AS retest,
+				count(*) FILTER (WHERE lower(trim(status))='invalid') AS invalid,
+				count(*) FILTER (WHERE lower(trim(status)) IN ('in_progress','in progress')) AS in_progress,
+				count(*) FILTER (WHERE lower(trim(status)) IN ('cancel','cancelled','canceled')) AS cancelled
+			FROM (
+				SELECT r.status, ROW_NUMBER() OVER (PARTITION BY r.case_id ORDER BY r.ended_at DESC NULLS LAST,r.result_id DESC) AS rn
+				FROM qase_results r
+				JOIN qase_run_cases rc ON rc.project_code=r.project_code AND rc.run_id=r.run_id AND rc.case_id=r.case_id
+				WHERE r.project_code=? AND r.run_id IN ?
+			) latest WHERE rn=1`
+			// Scan into a separate dest for the same reason as
+			// ProjectEnvironmentCounts (gorm would zero out.Total).
+			var executed struct {
+				Passed     int64
+				Failed     int64
+				Blocked    int64
+				Skipped    int64
+				Retest     int64
+				Invalid    int64
+				InProgress int64 `gorm:"column:in_progress"`
+				Cancelled  int64
+			}
+			if err := r.db.Raw(q, p.QaseProjectCode, runIDs).Scan(&executed).Error; err != nil {
+				return Counts{}, false, err
+			}
+			out.Passed, out.Failed, out.Blocked = executed.Passed, executed.Failed, executed.Blocked
+			out.Skipped, out.Retest, out.Invalid = executed.Skipped, executed.Retest, executed.Invalid
+			out.InProgress, out.Cancelled = executed.InProgress, executed.Cancelled
 		}
-		found = true
-		out.Passed += counts.Passed
-		out.Failed += counts.Failed
-		out.Blocked += counts.Blocked
-		out.Total += membership
 	}
-	// Prefer Qase's own project-wide case count over the run-membership sum
-	// above, which only covers cases attached to currently tracked runs.
-	if p.QaseTotalCases > 0 {
+	// Denominator is the distinct case membership of tracked runs — repo
+	// cases never attached to a run don't count as "untested" (Qase's
+	// project-wide stat can also include stale/deleted cases). Only when
+	// nothing is attached do we fall back to the repo count so an untouched
+	// project still reports its real total.
+	if out.Total == 0 && p.QaseTotalCases > 0 {
 		out.Total = p.QaseTotalCases
 		found = true
 	}
@@ -771,15 +841,40 @@ func (r *Monitoring) ProjectEnvironmentCounts(p Project, environment string) (Co
 		p.QaseProjectCode, runIDs).Scan(&out.Total).Error; err != nil {
 		return Counts{}, err
 	}
-	q := `SELECT count(*) FILTER (WHERE status='passed') AS passed,count(*) FILTER (WHERE status='failed') AS failed,count(*) FILTER (WHERE status='blocked') AS blocked FROM (SELECT r.status, ROW_NUMBER() OVER (PARTITION BY r.case_id ORDER BY r.ended_at DESC NULLS LAST,r.result_id DESC) AS rn FROM qase_results r JOIN qase_run_cases rc ON rc.project_code=r.project_code AND rc.run_id=r.run_id AND rc.case_id=r.case_id WHERE r.project_code=? AND r.run_id IN ?) latest WHERE rn=1`
+	q := `SELECT
+		count(*) FILTER (WHERE lower(trim(status))='passed') AS passed,
+		count(*) FILTER (WHERE lower(trim(status))='failed') AS failed,
+		count(*) FILTER (WHERE lower(trim(status))='blocked') AS blocked,
+		count(*) FILTER (WHERE lower(trim(status))='skipped') AS skipped,
+		count(*) FILTER (WHERE lower(trim(status))='retest') AS retest,
+		count(*) FILTER (WHERE lower(trim(status))='invalid') AS invalid,
+		count(*) FILTER (WHERE lower(trim(status)) IN ('in_progress','in progress')) AS in_progress,
+		count(*) FILTER (WHERE lower(trim(status)) IN ('cancel','cancelled','canceled')) AS cancelled
+	FROM (
+		SELECT r.status, ROW_NUMBER() OVER (PARTITION BY r.case_id ORDER BY r.ended_at DESC NULLS LAST,r.result_id DESC) AS rn
+		FROM qase_results r
+		JOIN qase_run_cases rc ON rc.project_code=r.project_code AND rc.run_id=r.run_id AND rc.case_id=r.case_id
+		WHERE r.project_code=? AND r.run_id IN ?
+	) latest WHERE rn=1`
 	// A separate dest: scanning the "total"-less result set of this query
 	// straight into &out would zero the Total we just set above (gorm
 	// clears struct fields with no matching column on each Scan).
-	var executed struct{ Passed, Failed, Blocked int64 }
+	var executed struct {
+		Passed     int64
+		Failed     int64
+		Blocked    int64
+		Skipped    int64
+		Retest     int64
+		Invalid    int64
+		InProgress int64 `gorm:"column:in_progress"`
+		Cancelled  int64
+	}
 	if err := r.db.Raw(q, p.QaseProjectCode, runIDs).Scan(&executed).Error; err != nil {
 		return Counts{}, err
 	}
 	out.Passed, out.Failed, out.Blocked = executed.Passed, executed.Failed, executed.Blocked
+	out.Skipped, out.Retest, out.Invalid = executed.Skipped, executed.Retest, executed.Invalid
+	out.InProgress, out.Cancelled = executed.InProgress, executed.Cancelled
 	return out, nil
 }
 
@@ -951,7 +1046,9 @@ func (r *Monitoring) ProjectRuns(p Project) ([]ProjectRun, error) {
 		summary := ProjectRun{
 			RunID: run.RunID, Title: run.Title, Environment: DashboardEnvironment(run.Title),
 			Platform: strings.TrimSpace(platform), Scope: runScopeLabel(run.Title, platform), Testers: testers,
-			Passed: counts.Passed, Failed: counts.Failed, Blocked: counts.Blocked, Total: membership,
+			Passed: counts.Passed, Failed: counts.Failed, Blocked: counts.Blocked,
+			Skipped: counts.Skipped, Retest: counts.Retest, Invalid: counts.Invalid,
+			InProgress: counts.InProgress, Cancelled: counts.Cancelled, Total: membership,
 			StartedAt: run.StartedAt, FinishedAt: run.FinishedAt,
 		}
 		if run.StartedAt != nil && run.FinishedAt != nil && !run.FinishedAt.Before(*run.StartedAt) {
@@ -1323,11 +1420,12 @@ func (r *Monitoring) Workflow(from, to time.Time, projectID string) ([]WorkflowD
 	return rows, err
 }
 
+// Tester names match normalized (lower+trim) — see normTester in Workload.
 var workloadQaseCountQuery = `
 SELECT count(*) FROM qase_results
 JOIN qase_cases qc ON qc.project_code = qase_results.project_code AND qc.case_id = qase_results.case_id
 JOIN qase_runs qr2 ON qr2.project_code = qase_results.project_code AND qr2.run_id = qase_results.run_id
-WHERE ` + testerColumnCaseSQL("qc", "qr2") + ` = ? AND qase_results.ended_at >= ? AND qase_results.ended_at < ? AND qase_results.project_code IN (SELECT qase_project_code FROM projects WHERE qase_project_code <> '')`
+WHERE lower(trim(` + testerColumnCaseSQL("qc", "qr2") + `)) = ? AND qase_results.ended_at >= ? AND qase_results.ended_at < ? AND qase_results.project_code IN (SELECT qase_project_code FROM projects WHERE qase_project_code <> '')`
 
 var workloadQaseDailyQuery = `
 SELECT to_char(qase_results.ended_at, 'YYYY-MM-DD') as date,
@@ -1338,7 +1436,7 @@ SELECT to_char(qase_results.ended_at, 'YYYY-MM-DD') as date,
 FROM qase_results
 JOIN qase_cases qc ON qc.project_code = qase_results.project_code AND qc.case_id = qase_results.case_id
 JOIN qase_runs qr2 ON qr2.project_code = qase_results.project_code AND qr2.run_id = qase_results.run_id
-WHERE ` + testerColumnCaseSQL("qc", "qr2") + ` = ? AND qase_results.ended_at >= ? AND qase_results.ended_at < ? AND qase_results.project_code IN (SELECT qase_project_code FROM projects WHERE qase_project_code <> '')
+WHERE lower(trim(` + testerColumnCaseSQL("qc", "qr2") + `)) = ? AND qase_results.ended_at >= ? AND qase_results.ended_at < ? AND qase_results.project_code IN (SELECT qase_project_code FROM projects WHERE qase_project_code <> '')
 GROUP BY date ORDER BY date`
 
 // workloadQaseProjectsQuery lists the dashboard-registered projects a QA has
@@ -1349,7 +1447,7 @@ FROM qase_results
 JOIN qase_cases qc ON qc.project_code = qase_results.project_code AND qc.case_id = qase_results.case_id
 JOIN qase_runs qr2 ON qr2.project_code = qase_results.project_code AND qr2.run_id = qase_results.run_id
 JOIN projects p ON p.qase_project_code = qase_results.project_code AND p.qase_project_code <> ''
-WHERE ` + testerColumnCaseSQL("qc", "qr2") + ` = ? AND qase_results.ended_at >= ? AND qase_results.ended_at < ?
+WHERE lower(trim(` + testerColumnCaseSQL("qc", "qr2") + `)) = ? AND qase_results.ended_at >= ? AND qase_results.ended_at < ?
 ORDER BY key`
 
 // distinctSyncedTesterNamesQuery lists every name that has actually appeared
@@ -1387,6 +1485,10 @@ func (r *Monitoring) Workload(from, to time.Time, memberID string) ([]WorkloadMe
 	if err := r.db.Order("name").Find(&members).Error; err != nil {
 		return nil, err
 	}
+	// Tester names are compared normalized (lower+trim): Qase stores whatever
+	// casing was typed ("amalia"), while qa_members may register "Amalia" —
+	// a case difference must not split one QA into two workload rows.
+	normTester := func(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
 	roster := make([]workloadRoster, 0, len(members))
 	registeredQaseNames := map[string]bool{}
 	for _, m := range members {
@@ -1396,7 +1498,7 @@ func (r *Monitoring) Workload(from, to time.Time, memberID string) ([]WorkloadMe
 		// An inactive member's Qase name stays reserved so it doesn't resurface
 		// below as a bare, unregistered Qase tester — inactive means hidden.
 		if m.QaseDisplayName != "" {
-			registeredQaseNames[m.QaseDisplayName] = true
+			registeredQaseNames[normTester(m.QaseDisplayName)] = true
 		}
 		if !m.Active {
 			continue
@@ -1410,7 +1512,7 @@ func (r *Monitoring) Workload(from, to time.Time, memberID string) ([]WorkloadMe
 		}
 		sort.Strings(names)
 		for _, name := range names {
-			if registeredQaseNames[name] {
+			if registeredQaseNames[normTester(name)] {
 				continue
 			}
 			roster = append(roster, workloadRoster{id: name, name: name, qaseDisplayName: name})
@@ -1429,13 +1531,14 @@ func (r *Monitoring) Workload(from, to time.Time, memberID string) ([]WorkloadMe
 			return nil, err
 		}
 		if m.qaseDisplayName != "" {
-			if err := r.db.Raw(workloadQaseCountQuery, m.qaseDisplayName, from, to).Scan(&v.QaseExecutions).Error; err != nil {
+			qaseName := normTester(m.qaseDisplayName)
+			if err := r.db.Raw(workloadQaseCountQuery, qaseName, from, to).Scan(&v.QaseExecutions).Error; err != nil {
 				return nil, err
 			}
-			if err := r.db.Raw(workloadQaseDailyQuery, m.qaseDisplayName, from, to).Scan(&v.DailyExecutions).Error; err != nil {
+			if err := r.db.Raw(workloadQaseDailyQuery, qaseName, from, to).Scan(&v.DailyExecutions).Error; err != nil {
 				return nil, err
 			}
-			if err := r.db.Raw(workloadQaseProjectsQuery, m.qaseDisplayName, from, to).Scan(&v.QaseProjects).Error; err != nil {
+			if err := r.db.Raw(workloadQaseProjectsQuery, qaseName, from, to).Scan(&v.QaseProjects).Error; err != nil {
 				return nil, err
 			}
 		}

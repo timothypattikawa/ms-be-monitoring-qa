@@ -357,7 +357,47 @@ func TestProjectEnvironmentCountsDedupesSharedCasesAcrossRuns(t *testing.T) {
 	}
 }
 
-func TestProjectCountsPrefersQaseTotalCasesOverRunMembership(t *testing.T) {
+func TestProjectCountsDedupesCasesAcrossEnvironments(t *testing.T) {
+	repo := NewSQLiteForTest(t)
+	now := time.Now().UTC()
+	// Same scenario is attached to an STG run and a BETA run — it's one
+	// scenario re-tested in the next phase, not two scenarios.
+	if _, err := repo.UpsertRun(&QaseRun{ID: "run1", ProjectCode: "ILTA", RunID: 1, Title: "[STG] Android", Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.UpsertRun(&QaseRun{ID: "run2", ProjectCode: "ILTA", RunID: 2, Title: "[BETA] Android", Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceRunCases("ILTA", 1, []int64{1, 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceRunCases("ILTA", 2, []int64{1, 3}); err != nil {
+		t.Fatal(err)
+	}
+	results := []QaseResult{
+		{ID: "res1", ProjectCode: "ILTA", ResultID: "res1", RunID: 1, CaseID: 1, Status: "passed", EndedAt: &now},
+		{ID: "res2", ProjectCode: "ILTA", ResultID: "res2", RunID: 1, CaseID: 2, Status: "passed", EndedAt: &now},
+		{ID: "res3", ProjectCode: "ILTA", ResultID: "res3", RunID: 2, CaseID: 1, Status: "passed", EndedAt: &now},
+		{ID: "res4", ProjectCode: "ILTA", ResultID: "res4", RunID: 2, CaseID: 3, Status: "passed", EndedAt: &now},
+	}
+	for i := range results {
+		if _, err := repo.UpsertResult(&results[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := Project{QaseProjectCode: "ILTA"}
+	counts, ok, err := repo.ProjectCounts(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 3 unique cases (1,2,3), all passed — a per-run sum would report
+	// Total=4 and Passed=4, which can never satisfy passed==total.
+	if !ok || counts.Total != 3 || counts.Passed != 3 || counts.Failed != 0 {
+		t.Fatalf("expected deduped all-passed counts, got %+v (ok=%v)", counts, ok)
+	}
+}
+
+func TestProjectCountsFallsBackToQaseTotalCasesOnlyWithoutRunCoverage(t *testing.T) {
 	repo := NewSQLiteForTest(t)
 	now := time.Now().UTC()
 	saved, err := repo.SaveProjectMapping("INIT-683", "Live Tracking", "ILTA", "Kiki", now, now, now, now)
@@ -393,11 +433,23 @@ func TestProjectCountsPrefersQaseTotalCasesOverRunMembership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Total reflects Qase's own project-wide case count (542), not the 2
-	// cases attached to the currently tracked run. Passed/Failed still come
-	// from actual executed results.
-	if !ok || counts.Total != 542 || counts.Passed != 1 || counts.Failed != 1 {
+	// With run coverage the denominator is run membership (2), not Qase's
+	// project-wide stat (542) — repo cases never attached to a run aren't
+	// untested. Passed/Failed still come from actual executed results.
+	if !ok || counts.Total != 2 || counts.Passed != 1 || counts.Failed != 1 {
 		t.Fatalf("unexpected counts: %+v (ok=%v)", counts, ok)
+	}
+	// Once no run carries cases, the repo count is the fallback so an
+	// untouched project still reports its real total.
+	if err := repo.MarkRunsInactive("ILTA", nil); err != nil {
+		t.Fatal(err)
+	}
+	counts, ok, err = repo.ProjectCounts(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || counts.Total != 542 || counts.Passed != 0 {
+		t.Fatalf("expected repo-total fallback, got %+v (ok=%v)", counts, ok)
 	}
 }
 

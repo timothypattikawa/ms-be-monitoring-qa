@@ -3,6 +3,7 @@ package monitoring
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -16,9 +17,10 @@ import (
 )
 
 type API struct {
-	Repo      *repository.Monitoring
-	Connector Connector
-	Solr      Solr
+	Repo             *repository.Monitoring
+	Connector        Connector
+	Solr             Solr
+	AlertEmailSender AlertEmailSender
 }
 type sourceState struct {
 	Status   string     `json:"status"`
@@ -174,6 +176,10 @@ func (a API) Register(e *echo.Echo) {
 	g.GET("/projects", a.projects)
 	g.GET("/projects/:id", a.project)
 	g.POST("/projects", a.createProject, a.managerAuth)
+	g.PATCH("/projects/:id", a.updateProject, a.managerAuth)
+	g.GET("/qa-timeline", a.qaTimeline)
+	g.GET("/qa-alert-email/status", a.qaAlertEmailStatus)
+	g.POST("/projects/:id/qa-alert-email", a.sendProjectQaAlertEmail, a.managerAuth)
 	g.GET("/qa-members", a.members)
 	g.GET("/qa-members/:id", a.member)
 	g.POST("/qa-members", a.createMember, a.managerAuth)
@@ -480,6 +486,65 @@ func (a API) updateMember(c echo.Context) error {
 		resp.Warnings = warnings
 	}
 	return c.JSON(http.StatusOK, resp)
+}
+
+// qaTimeline serves the Bugs-page "QA timeline & scenario" widget: one row
+// per active project with the STG-run window, working-day breakdown, manual
+// plan/size, and total scenarios.
+func (a API) qaTimeline(c echo.Context) error {
+	rows, err := a.Repo.QaTimelines()
+	if err != nil {
+		return safeError(c, err)
+	}
+	return a.send(c, rows)
+}
+
+// updateProject edits the manual planning fields (projectSize,
+// timelinePlanDays). Keys are presence-checked on the raw body so an
+// explicit JSON null clears the field — omitting the key leaves it as-is.
+func (a API) updateProject(c echo.Context) error {
+	p, err := a.Repo.Project(c.Param("id"))
+	if errors.Is(err, repository.ErrNotFound) {
+		return c.JSON(http.StatusNotFound, map[string]string{"code": "NOT_FOUND", "message": "project not found"})
+	}
+	if err != nil {
+		return safeError(c, err)
+	}
+	var req map[string]json.RawMessage
+	if err := c.Bind(&req); err != nil {
+		return invalidProjectUpdate(c)
+	}
+	if raw, ok := req["projectSize"]; ok {
+		var size *string
+		if err := json.Unmarshal(raw, &size); err != nil {
+			return invalidProjectUpdate(c)
+		}
+		if size == nil || strings.TrimSpace(*size) == "" {
+			p.ProjectSize = nil
+		} else if v := strings.ToUpper(strings.TrimSpace(*size)); !allowedProjectSizes[v] {
+			return invalidProjectUpdate(c)
+		} else {
+			p.ProjectSize = &v
+		}
+	}
+	if raw, ok := req["timelinePlanDays"]; ok {
+		var days *float64
+		if err := json.Unmarshal(raw, &days); err != nil {
+			return invalidProjectUpdate(c)
+		}
+		if days != nil && *days < 0 {
+			return invalidProjectUpdate(c)
+		}
+		p.TimelinePlanDays = days
+	}
+	if err := a.Repo.SaveProject(&p); err != nil {
+		return safeError(c, err)
+	}
+	return c.JSON(http.StatusOK, p)
+}
+
+func invalidProjectUpdate(c echo.Context) error {
+	return c.JSON(http.StatusBadRequest, map[string]string{"code": "INVALID_PROJECT_UPDATE", "message": "projectSize must be a known size and timelinePlanDays must not be negative"})
 }
 
 func invalidProject(c echo.Context) error {
