@@ -26,6 +26,7 @@ Last sync = `index.lastModified` (proxy: waktu index terakhir berubah). Tidak ad
 ## API backend (`/api/v1/knowledge`, pola sama `documents`)
 - `GET /knowledge/overview` → `{ ram:{usedGb,totalGb,pct}, lastFullSync, embedding:{model,dimension}, collectionsActive, autoSyncEvery }`
 - `GET /knowledge/collections` → `[{ name, docCount, target, coveragePct, status, lastSyncedAt, outdatedDocs, sizeBytes }]`
+- `GET /knowledge/projects` → `{ totals:{collections,docs,projects,emptyCollections}, collections:[{ name,label,docCount,projectCount,projects:[{code,name,docs}] }] }` (untuk UI dashboard baru: kartu ringkasan, bar chart, section per collection). Endpoint `collections` dan `documents` di atas tetap ada.
 - `GET /knowledge/documents?collection=&q=&page=&pageSize=` → `{ items:[{ id, title, key, sourceUrl, collection, chunks, dims, lastSyncedAt, syncStatus }], total }`
 - `POST /knowledge/collections/:name/sync` | `/reindex` (managerAuth) → membuat sync job, dipoll lewat `/sync-jobs/:id`. **Perlu keputusan**: pipeline embedding/indexing ada di luar repo ini — endpoint ini hanya trigger (webhook/queue?) ke pipeline tsb.
 
@@ -53,3 +54,4 @@ Status dokumen: `SYNCED`, `QUEUED`, `FAILED` (mis. token exceeded), `SYNCING`.
 - `/knowledge/documents` tanpa `collection` -> query vector collection; `collection` tiap item = `prefix+lower(project)` bila core itu ada, selain itu nama vector collection. `collection` divalidasi terhadap daftar core dinamis (404 `COLLECTION_NOT_FOUND`).
 - Solr tidak terjangkau -> 502 `SOLR_UNAVAILABLE` (tanpa URL/kredensial). `SOLR_SYNC_STALE_AFTER` mendukung sufiks `d`.
 - Sync/reindex: validasi nama collection, POST `{collection,mode}` ke `SOLR_SYNC_WEBHOOK_URL`; respons 202 `{collection,mode,status:"ACCEPTED"}`.
+- `/knowledge/projects`: collection = vector collection (label "Default / Utama", pertama) + core prefix (urut nama), termasuk yang kosong. Jumlah per project dari facet Solr `project` (maks 4 request paralel, timeout 15s per core); core gagal -> `projects:[]` + `error:"facet_failed"`, STATUS gagal -> 502 `SOLR_UNAVAILABLE`. `totals.projects` = kode project distinct lintas collection. Nama project dari Qase `GET /v1/project` (cache memori 10 menit), fallback tabel `projects` lokal, lalu `""`.
