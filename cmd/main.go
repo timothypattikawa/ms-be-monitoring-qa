@@ -103,7 +103,7 @@ func main() {
 			e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
 				AllowOrigins: []string{"http://localhost:4200", "http://127.0.0.1:4200"},
 				AllowHeaders: []string{echo.HeaderOrigin, echo.HeaderContentType, echo.HeaderAccept, "X-Manager-Key", "Idempotency-Key"},
-				AllowMethods: []string{http.MethodGet, http.MethodPost, http.MethodOptions},
+				AllowMethods: []string{http.MethodGet, http.MethodPost, http.MethodPatch, http.MethodDelete, http.MethodOptions},
 			}))
 			e.Use(otelecho.Middleware(otelshared.ServiceName, otelecho.WithSkipper(otelSkipper)))
 			e.Use(otelshared.NewMetricsMiddleware(otelMetrics, otelSkipper))

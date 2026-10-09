@@ -115,7 +115,19 @@ from these values.
 `/sync-jobs/{id}` return `{asOf,sources,data}`. Source status is `fresh`,
 `stale`, or `never_synced`; staleness currently means older than 24 hours.
 `POST /api/v1/projects` registers a mapping and enqueues validation;
-`POST /api/v1/sync-jobs` returns `202` and a job with steps/events. Qase
+`PATCH /api/v1/projects/{id}` (manager key) edits the manual planning fields
+`projectSize` and `timelinePlanDays` — send a JSON `null` to clear a value;
+`POST /api/v1/sync-jobs` returns `202` and a job with steps/events.
+
+`GET /api/v1/qa-timeline` backs the Bugs-page "QA timeline & scenario"
+widget: per project it derives `qaStartAt`/`qaEndAt` from every STG-prefixed
+Qase run (run start/end times, falling back to that run's result timestamps
+when null), `workingDays` = calendar span minus Sat/Sun minus
+`national_holidays` rows that land on weekdays. Cuti bersama is deliberately
+not in the holiday table and never subtracted. The table is auto-seeded for
+2025–2026 from the SKB 3 Menteri decrees at `AutoMigrate`; add later years
+by inserting rows or extending `nationalHolidaySeed` in
+`internal/repository/timeline.go`. Qase
 sync fetches the selected run directly and pages cases and results at 100
 records per request. Results use Qase's `run` filter. Run membership is
 reconciled on each sync; malformed or incomplete
